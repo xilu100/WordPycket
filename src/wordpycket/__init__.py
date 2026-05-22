@@ -1,0 +1,2 @@
+"""WordPycket desktop application."""
+
