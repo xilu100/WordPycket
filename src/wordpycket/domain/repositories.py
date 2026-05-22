@@ -25,3 +25,30 @@ class WordRepository(ABC):
     @abstractmethod
     def delete(self, entry_id: str) -> None:
         raise NotImplementedError
+
+    @abstractmethod
+    def reset_progress(self) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def replace_all(self, entries: list[WordEntry]) -> int:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_examples(
+        self,
+        entry_id: str,
+        example_sentence: str,
+        example_sentence_cn: str,
+    ) -> None:
+        raise NotImplementedError
+
+    @abstractmethod
+    def update_text(
+        self,
+        entry_id: str,
+        word: str,
+        meaning: str,
+        forms: str,
+    ) -> None:
+        raise NotImplementedError

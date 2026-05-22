@@ -24,4 +24,6 @@ class WordFrequencyCsvImporter:
             meaning=row.get("Chinese", ""),
             frequency=int(row.get("Frequency", "0") or 0),
             forms=row.get("Forms", ""),
+            example_sentence=row.get("Example", ""),
+            example_sentence_cn=row.get("ExampleChinese", ""),
         )

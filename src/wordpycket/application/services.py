@@ -1,4 +1,5 @@
-from datetime import datetime
+import random
+import re
 
 from wordpycket.domain.entities import WordEntry
 from wordpycket.domain.repositories import WordRepository
@@ -15,6 +16,8 @@ class WordService:
         source_index: int = 0,
         frequency: int = 0,
         forms: str = "",
+        example_sentence: str = "",
+        example_sentence_cn: str = "",
     ) -> WordEntry:
         entry = WordEntry(
             word=word,
@@ -22,12 +25,17 @@ class WordService:
             source_index=source_index,
             frequency=frequency,
             forms=forms,
+            example_sentence=example_sentence,
+            example_sentence_cn=example_sentence_cn,
         )
         self._repository.save(entry)
         return entry
 
     def import_words(self, entries: list[WordEntry]) -> int:
         return self._repository.save_many(entries)
+
+    def get_word(self, entry_id: str) -> WordEntry | None:
+        return self._repository.get(entry_id)
 
     def list_words(self, query: str = "") -> list[WordEntry]:
         entries = sorted(
@@ -37,34 +45,27 @@ class WordService:
         keyword = query.strip().lower()
         if not keyword:
             return entries
+        keywords = {
+            keyword,
+            self._normalize_search_text(keyword),
+        }
 
         return [
             entry
             for entry in entries
-            if keyword in entry.word.lower()
-            or keyword in entry.meaning.lower()
-            or keyword in entry.forms.lower()
+            if any(
+                candidate in self._entry_search_text(entry)
+                for candidate in keywords
+                if candidate
+            )
         ]
 
     def next_review_word(self) -> WordEntry | None:
-        entries = self._repository.list()
+        entries = [entry for entry in self._repository.list() if not entry.is_learned]
         if not entries:
             return None
 
-        now = datetime.now()
-        due_entries = [entry for entry in entries if entry.next_review_at() <= now]
-        if not due_entries:
-            return None
-
-        return min(
-            due_entries,
-            key=lambda entry: (
-                entry.next_review_at(),
-                entry.mastery_level,
-                -entry.frequency,
-                entry.source_index,
-            ),
-        )
+        return random.choice(entries)
 
     def mark_known(self, entry_id: str) -> WordEntry | None:
         entry = self._repository.get(entry_id)
@@ -72,6 +73,15 @@ class WordService:
             return None
 
         updated = entry.mark_known()
+        self._repository.save(updated)
+        return updated
+
+    def mark_definitely_known(self, entry_id: str) -> WordEntry | None:
+        entry = self._repository.get(entry_id)
+        if entry is None:
+            return None
+
+        updated = entry.mark_definitely_known()
         self._repository.save(updated)
         return updated
 
@@ -86,3 +96,55 @@ class WordService:
 
     def delete_word(self, entry_id: str) -> None:
         self._repository.delete(entry_id)
+
+    def reset_progress(self) -> None:
+        self._repository.reset_progress()
+
+    def replace_words(self, entries: list[WordEntry]) -> int:
+        return self._repository.replace_all(entries)
+
+    def update_examples(
+        self,
+        entry_id: str,
+        example_sentence: str,
+        example_sentence_cn: str,
+    ) -> WordEntry | None:
+        self._repository.update_examples(
+            entry_id,
+            example_sentence,
+            example_sentence_cn,
+        )
+        return self._repository.get(entry_id)
+
+    def update_text(
+        self,
+        entry_id: str,
+        word: str,
+        meaning: str,
+        forms: str,
+    ) -> WordEntry | None:
+        self._repository.update_text(
+            entry_id,
+            word,
+            meaning,
+            forms,
+        )
+        return self._repository.get(entry_id)
+
+    @classmethod
+    def _entry_search_text(cls, entry: WordEntry) -> str:
+        values = (
+            entry.word,
+            entry.meaning,
+            entry.forms,
+            entry.example_sentence,
+            entry.example_sentence_cn,
+        )
+        raw_text = " ".join(value.lower() for value in values)
+        return f"{raw_text} {cls._normalize_search_text(raw_text)}"
+
+    @staticmethod
+    def _normalize_search_text(text: str) -> str:
+        normalized = re.sub(r"[_]+", " ", text)
+        normalized = re.sub(r"\s+", " ", normalized)
+        return normalized.strip()

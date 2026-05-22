@@ -1,8 +1,12 @@
 [project]
 name = "wordpycket"
 version = "0.1.0"
-description = "A small Tkinter desktop app built with DDD onion architecture."
+description = "A small Qt desktop app built with DDD onion architecture."
 requires-python = ">=3.10"
+dependencies = [
+    "llama-cpp-python>=0.3.0",
+    "PySide6>=6.7",
+]
 
 [project.scripts]
 wordpycket = "wordpycket.main:main"
