@@ -38,6 +38,7 @@ def main() -> int:
     install_llama_cpp(python, select_device(args.device), args.strict_accel)
     install_nltk_data(python)
     install_spacy_models(python, args.spacy_models)
+    install_project(python)
     print_activation_help(venv_path)
     return 0
 
@@ -65,11 +66,21 @@ def parse_args() -> argparse.Namespace:
 
 
 def create_venv(venv_path: Path) -> None:
-    if venv_python(venv_path).exists():
+    python = venv_python(venv_path)
+    if python.exists():
         print(f"Using existing virtual environment: {venv_path}")
+        ensure_pip(python)
         return
     print(f"Creating virtual environment: {venv_path}")
     venv.EnvBuilder(with_pip=True, clear=False).create(venv_path)
+    ensure_pip(venv_python(venv_path))
+
+
+def ensure_pip(python: Path) -> None:
+    result = subprocess.run([str(python), "-m", "pip", "--version"], cwd=PROJECT_ROOT, check=False)
+    if result.returncode == 0:
+        return
+    run([str(python), "-m", "ensurepip", "--upgrade"])
 
 
 def configure_local_runtime() -> None:
@@ -102,6 +113,10 @@ def install_base_dependencies(python: Path) -> None:
             filtered_requirements.unlink()
         except FileNotFoundError:
             pass
+
+
+def install_project(python: Path) -> None:
+    run([str(python), "-m", "pip", "install", "--no-deps", "-e", str(PROJECT_ROOT)])
 
 
 def project_dependencies() -> list[str]:

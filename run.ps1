@@ -50,7 +50,7 @@ Install-LocalPython
 
 $NeedsSetup = -not (Test-Path $SetupMarker)
 if (-not (Test-Path $VenvPython)) {
-    & $UvExe venv --managed-python --python $PythonVersion $VenvPath
+    & $UvExe venv --seed --python $PythonVersion $VenvPath
     $NeedsSetup = $true
 }
 

@@ -59,7 +59,7 @@ install_local_python
 
 needs_setup=0
 if [ ! -x "$VENV_PYTHON" ]; then
-    "$UV_EXE" venv --managed-python --python "$PYTHON_VERSION" "$VENV_PATH"
+    "$UV_EXE" venv --seed --python "$PYTHON_VERSION" "$VENV_PATH"
     needs_setup=1
 fi
 

@@ -1,4 +1,4 @@
-# WordPycket
+yhege1wen# WordPycket
 
 WordPycket 是一个本地运行的 Qt 桌面词汇学习工具。它可以从 CSV 导入词库，也可以从 PDF 自动解析词频并生成 CSV；学习进度、例句和词库数据都保存在项目目录内。
 
