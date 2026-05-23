@@ -52,6 +52,7 @@ _install_llama_cleanup_error_filter()
 class GeneratedExample:
     example_sentence: str
     example_sentence_cn: str
+    meaning: str = ""
 
 
 @dataclass(frozen=True)
@@ -104,7 +105,7 @@ class LocalLlmExampleGenerator:
         llm = self._load_model(0)
         prompt = self._build_prompt(entry, scope)
         content = self._call_model(llm, prompt)
-        return self._parse_response(content)
+        return self._parse_response(content, require_meaning=not entry.meaning.strip())
 
     def generate_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedExample:
         if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
@@ -113,6 +114,7 @@ class LocalLlmExampleGenerator:
         return GeneratedExample(
             example_sentence=str(data["example_sentence"]),
             example_sentence_cn=str(data["example_sentence_cn"]),
+            meaning=str(data.get("meaning", "")),
         )
 
     def correct_entry(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
@@ -480,7 +482,7 @@ class LocalLlmExampleGenerator:
         llm = self._load_model(slot)
         prompt = self._build_prompt(entry, scope)
         content = self._call_model(llm, prompt)
-        return entry, self._parse_response(content)
+        return entry, self._parse_response(content, require_meaning=not entry.meaning.strip())
 
     def _correct_with_slot(
         self,
@@ -693,7 +695,7 @@ class LocalLlmExampleGenerator:
             response = llm.create_chat_completion(
                 messages=messages,
                 temperature=0.4,
-                max_tokens=160,
+                max_tokens=200,
                 response_format={"type": "json_object"},
             )
             return LocalLlmExampleGenerator._extract_chat_content(response)
@@ -701,7 +703,7 @@ class LocalLlmExampleGenerator:
             response = llm.create_completion(
                 prompt=LocalLlmExampleGenerator._build_completion_prompt(prompt),
                 temperature=0.4,
-                max_tokens=160,
+                max_tokens=200,
                 stop=["\n\n"],
             )
             return LocalLlmExampleGenerator._extract_completion_text(response)
@@ -842,20 +844,31 @@ class LocalLlmExampleGenerator:
     def _build_prompt(entry: WordEntry, scope: str = "") -> str:
         forms = f"\nWord forms: {entry.forms}" if entry.forms else ""
         scope_text = LocalLlmExampleGenerator._build_scope_text(scope)
+        meaning_text = entry.meaning or "(empty)"
+        meaning_requirement = (
+            "- The Chinese meaning is empty; provide a concise Chinese vocabulary meaning in the meaning field.\n"
+            if not entry.meaning
+            else "- Do not change, validate, or repeat the Chinese meaning field.\n"
+        )
+        json_shape = (
+            '{"example_sentence": "...", "example_sentence_cn": "...", "meaning": "..."}'
+            if not entry.meaning
+            else '{"example_sentence": "...", "example_sentence_cn": "..."}'
+        )
         return (
             "Generate one natural, short English sentence for this vocabulary word, "
             "and provide a fluent Chinese translation.\n"
             f"{scope_text}"
             f"Word: {entry.word}\n"
-            f"Chinese meaning: {entry.meaning}"
+            f"Chinese meaning: {meaning_text}"
             f"{forms}\n"
             "Requirements:\n"
             "- The English sentence must include the word or a common form of it.\n"
             "- Interpret the word according to the scope above when choosing meanings and translations.\n"
+            f"{meaning_requirement}"
             "- Keep the sentence under 16 English words.\n"
             "- Do not explain anything.\n"
-            'Return JSON exactly like: {"example_sentence": "...", '
-            '"example_sentence_cn": "..."}'
+            f"Return JSON exactly like: {json_shape}"
         )
 
     @staticmethod
@@ -896,7 +909,7 @@ class LocalLlmExampleGenerator:
         return normalized
 
     @staticmethod
-    def _parse_response(content: str) -> GeneratedExample:
+    def _parse_response(content: str, require_meaning: bool = False) -> GeneratedExample:
         cleaned = content.strip()
         if cleaned.startswith("```"):
             cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
@@ -913,12 +926,16 @@ class LocalLlmExampleGenerator:
 
         example_sentence = str(data.get("example_sentence", "")).strip()
         example_sentence_cn = str(data.get("example_sentence_cn", "")).strip()
+        meaning = str(data.get("meaning", "")).strip()
         if not example_sentence or not example_sentence_cn:
             raise RuntimeError(f"模型返回缺少例句字段：{content}")
+        if require_meaning and not meaning:
+            raise RuntimeError(f"模型返回缺少中文释义字段：{content}")
 
         return GeneratedExample(
             example_sentence=example_sentence,
             example_sentence_cn=example_sentence_cn,
+            meaning=meaning,
         )
 
     @staticmethod
@@ -975,6 +992,8 @@ def _main() -> None:
             "example_sentence": generated.example_sentence,
             "example_sentence_cn": generated.example_sentence_cn,
         }
+        if generated.meaning:
+            result["meaning"] = generated.meaning
     elif action == "correct":
         corrected = generator.correct_entry(entry, scope)
         result = {

@@ -2,6 +2,7 @@ import os
 import sys
 import time
 from collections.abc import Callable
+from pathlib import Path
 from typing import Protocol
 
 from PySide6.QtCore import QObject, QItemSelectionModel, QProcess, QProcessEnvironment, Qt, QThread, QTimer, Signal
@@ -10,6 +11,7 @@ from PySide6.QtWidgets import (
     QApplication,
     QAbstractItemView,
     QDialog,
+    QFileDialog,
     QFrame,
     QGraphicsDropShadowEffect,
     QGridLayout,
@@ -87,6 +89,23 @@ class ExampleGenerator(Protocol):
     def parse_isolated_result(self, stdout: str, stderr: str, returncode: int) -> dict: ...
 
 
+class CsvImportResult(Protocol):
+    entries: list[WordEntry]
+    language: str
+
+
+class PdfImportResult(Protocol):
+    language: str
+    csv_path: Path
+    imported_count: int
+
+
+class CsvDatasetResult(Protocol):
+    language: str
+    csv_path: Path
+    imported_count: int
+
+
 class BatchWorker(QObject):
     progress_changed = Signal(str, int, int, int, float)
     finished = Signal(str, list, list, int)
@@ -125,7 +144,7 @@ class BatchWorker(QObject):
                             entry.id,
                             generated.example_sentence,
                             generated.example_sentence_cn,
-                            "",
+                            generated.meaning,
                         )
                     )
             else:
@@ -193,12 +212,26 @@ class WordPycketApp:
     def __init__(
         self,
         service: WordService,
-        reset_entries_loader: Callable[[], list[WordEntry]],
         example_generator: ExampleGenerator | None = None,
+        csv_import_loader: Callable[[Path], CsvImportResult] | None = None,
+        csv_storage_path: Path | None = None,
+        pdf_import_loader: Callable[[Path], PdfImportResult] | None = None,
+        csv_files_loader: Callable[[], list[Path]] | None = None,
+        active_csv_loader: Callable[[], Path | None] | None = None,
+        csv_switcher: Callable[[Path], CsvDatasetResult] | None = None,
+        csv_upload_handler: Callable[[Path], CsvDatasetResult] | None = None,
+        csv_delete_handler: Callable[[Path], CsvDatasetResult | None] | None = None,
     ) -> None:
         self._service = service
-        self._reset_entries_loader = reset_entries_loader
         self._example_generator = example_generator
+        self._csv_import_loader = csv_import_loader
+        self._csv_storage_path = csv_storage_path
+        self._pdf_import_loader = pdf_import_loader
+        self._csv_files_loader = csv_files_loader
+        self._active_csv_loader = active_csv_loader
+        self._csv_switcher = csv_switcher
+        self._csv_upload_handler = csv_upload_handler
+        self._csv_delete_handler = csv_delete_handler
         self._study_session = StudySessionController(service)
         self._selected_id: str | None = None
         self._selected_ids: list[str] = []
@@ -235,6 +268,8 @@ class WordPycketApp:
         self._batch_status_label: QLabel | None = None
         self._supplement_button: QPushButton | None = None
         self._correct_button: QPushButton | None = None
+        self._upload_csv_button: QPushButton | None = None
+        self._upload_pdf_button: QPushButton | None = None
         self._pause_button: QPushButton | None = None
         self._stop_button: QPushButton | None = None
         self._unknown_button: QPushButton | None = None
@@ -365,7 +400,41 @@ class WordPycketApp:
                 border: 1px solid rgba(255, 255, 255, 210);
                 border-radius: 16px;
                 padding: 8px 10px;
+                color: #172033;
                 selection-background-color: #d8ebff;
+            }}
+            QDialog,
+            QInputDialog {{
+                background: #f7fbff;
+                color: #172033;
+            }}
+            QInputDialog QLabel {{
+                background: transparent;
+                color: #172033;
+            }}
+            QInputDialog QLineEdit {{
+                background: #ffffff;
+                color: #172033;
+                border: 1px solid #d8e4f2;
+                border-radius: 12px;
+                padding: 7px 10px;
+                selection-background-color: #d8ebff;
+                selection-color: #172033;
+            }}
+            QInputDialog QPushButton {{
+                background: #eef5ff;
+                color: #172033;
+                border: 1px solid #d8e4f2;
+                border-radius: 12px;
+                padding: 7px 18px;
+                min-width: 72px;
+                min-height: 22px;
+            }}
+            QInputDialog QPushButton:hover {{
+                background: #e2efff;
+            }}
+            QInputDialog QPushButton:pressed {{
+                background: #d8ebff;
             }}
             QMessageBox {{
                 background: #f7fbff;
@@ -554,6 +623,148 @@ class WordPycketApp:
         layout.addLayout(footer)
         self._set_page(root)
 
+    def _csv_selector_widget(self) -> QHBoxLayout | None:
+        if self._csv_files_loader is None or self._active_csv_loader is None or self._csv_switcher is None:
+            return None
+        row = QHBoxLayout()
+        active = self._active_csv_loader()
+        row.addWidget(QLabel(f"当前 CSV：{active.name if active else '无'}"))
+        row.addWidget(self._button("管理 CSV", self._show_csv_manager, "primary"))
+        row.addStretch()
+        return row
+
+    def _show_csv_manager(self) -> None:
+        if self._csv_files_loader is None or self._active_csv_loader is None:
+            return
+        dialog = QDialog(self._window)
+        dialog.setWindowTitle("管理 CSV")
+        dialog.resize(680, 420)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        title = QLabel("管理 CSV")
+        title.setObjectName("title")
+        layout.addWidget(title)
+
+        table = QTableWidget(0, 3)
+        table.setHorizontalHeaderLabels(["CSV", "状态", "路径"])
+        table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        table.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        table.verticalHeader().setVisible(False)
+        table.horizontalHeader().setStretchLastSection(True)
+        table.setColumnWidth(0, 220)
+        table.setColumnWidth(1, 90)
+        self._refresh_csv_manager_table(table)
+        layout.addWidget(table, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(self._button("刷新", lambda: self._refresh_csv_manager_table(table)))
+        actions.addWidget(self._button("关闭", dialog.reject))
+        actions.addWidget(self._button("选择", lambda: self._select_csv_from_manager(dialog, table), "primary"))
+        actions.addWidget(self._button("删除", lambda: self._delete_csv_from_manager(dialog, table), "danger"))
+        layout.addLayout(actions)
+        dialog.exec()
+
+    def _refresh_csv_manager_table(self, table: QTableWidget) -> None:
+        if self._csv_files_loader is None or self._active_csv_loader is None:
+            return
+        selected_path = self._selected_csv_path_from_table(table)
+        files = self._csv_files_loader()
+        active = self._active_csv_loader()
+        table.setRowCount(len(files))
+        selected_row = -1
+        active_row = -1
+        for row, path in enumerate(files):
+            values = [path.name, "当前" if active == path else "", str(path)]
+            for column, value in enumerate(values):
+                item = QTableWidgetItem(value)
+                item.setData(Qt.ItemDataRole.UserRole, str(path))
+                table.setItem(row, column, item)
+            if selected_path == path:
+                selected_row = row
+            if active == path:
+                active_row = row
+        table.clearSelection()
+        if selected_row >= 0:
+            table.selectRow(selected_row)
+        elif active_row >= 0:
+            table.selectRow(active_row)
+
+    @staticmethod
+    def _selected_csv_path_from_table(table: QTableWidget) -> Path | None:
+        selected = table.selectionModel().selectedRows()
+        if not selected:
+            return None
+        item = table.item(selected[0].row(), 0)
+        if item is None:
+            return None
+        value = item.data(Qt.ItemDataRole.UserRole)
+        return Path(str(value)) if value else None
+
+    def _select_csv_from_manager(self, dialog: QDialog, table: QTableWidget) -> None:
+        csv_path = self._selected_csv_path_from_table(table)
+        if csv_path is None:
+            QMessageBox.information(dialog, "未选择 CSV", "请先选择一个 CSV。")
+            return
+        if self._csv_switcher is None:
+            return
+        try:
+            result = self._csv_switcher(csv_path)
+        except Exception as error:
+            QMessageBox.critical(dialog, "CSV 切换失败", str(error))
+            return
+        self._study_session.clear_last_session()
+        self._study_session.reset()
+        self._selected_id = None
+        self._selected_ids = []
+        QMessageBox.information(
+            dialog,
+            "CSV 已切换",
+            f"当前 CSV：{result.csv_path.name}\n语言：{result.language}\n已同步 {result.imported_count} 个词条。",
+        )
+        dialog.accept()
+        self._show_word_list()
+
+    def _delete_csv_from_manager(self, dialog: QDialog, table: QTableWidget) -> None:
+        csv_path = self._selected_csv_path_from_table(table)
+        if csv_path is None:
+            QMessageBox.information(dialog, "未选择 CSV", "请先选择一个 CSV。")
+            return
+        if self._csv_delete_handler is None:
+            QMessageBox.information(dialog, "无法删除 CSV", "当前未配置 CSV 删除器。")
+            return
+        answer = QMessageBox.question(
+            dialog,
+            "确认删除 CSV",
+            f"确定删除 {csv_path.name} 吗？\n这会同时删除它对应的数据库和学习记录。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        try:
+            result = self._csv_delete_handler(csv_path)
+        except Exception as error:
+            QMessageBox.critical(dialog, "CSV 删除失败", str(error))
+            return
+        self._study_session.clear_last_session()
+        self._study_session.reset()
+        self._selected_id = None
+        self._selected_ids = []
+        if result is None:
+            QMessageBox.information(dialog, "CSV 已删除", "当前 CSV 已删除。input 中没有其它 CSV。")
+        else:
+            QMessageBox.information(
+                dialog,
+                "CSV 已删除",
+                f"当前 CSV 已删除。\n已切换到：{result.csv_path.name}\n已同步 {result.imported_count} 个词条。",
+            )
+        dialog.accept()
+        self._show_word_list()
+
     def _home_card(self, title: str, count: str, action: str, callback: Callable[[], None]) -> QFrame:
         card = self._panel()
         card.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
@@ -675,19 +886,19 @@ class WordPycketApp:
         text, accepted = QInputDialog.getText(
             self._window,
             "确认重置",
-            f"此操作会删除所有学习记录和例句。\n请输入“{confirmation_text}”以继续：",
+            f"此操作会保留 Index、英文、中文、频率、词形、例句和例句中文；其余学习进度字段会清零。\n请输入“{confirmation_text}”以继续：",
         )
         if not accepted:
             return
         if text.strip() != confirmation_text:
             QMessageBox.information(self._window, "未重置", "确认文本不匹配，学习进度未重置。")
             return
-        imported_count = self._service.replace_words(self._reset_entries_loader())
+        self._service.reset_progress()
         self._study_session.clear_last_session()
         QMessageBox.information(
             self._window,
             "已重置",
-            f"已从 CSV 重新导入 {imported_count} 个词条，原有学习记录已清空。",
+            "学习进度已重置，CSV 字段、例句和例句中文已保留。",
         )
         self._show_home()
 
@@ -872,6 +1083,9 @@ class WordPycketApp:
         title_bar.addStretch()
         title_bar.addWidget(self._button("返回主页", self._show_home))
         layout.addLayout(title_bar)
+        selector = self._csv_selector_widget()
+        if selector is not None:
+            layout.addLayout(selector)
 
         panel = self._panel()
         panel_layout = QVBoxLayout(panel)
@@ -913,9 +1127,13 @@ class WordPycketApp:
         action_row.addWidget(self._count_label, 1)
         self._supplement_button = self._button("智能补充选中", self._supplement_selected_example)
         self._correct_button = self._button("智能修正选中", self._correct_selected_entry)
+        self._upload_csv_button = self._button("上传 CSV", self._upload_csv)
+        self._upload_pdf_button = self._button("上传 PDF", self._upload_pdf)
         self._pause_button = self._button("暂停", self._toggle_batch_pause)
         self._stop_button = self._button("停止", self._stop_batch)
         delete_button = self._button("删除选中", self._delete_selected, "danger")
+        action_row.addWidget(self._upload_csv_button)
+        action_row.addWidget(self._upload_pdf_button)
         action_row.addWidget(self._supplement_button)
         action_row.addWidget(self._correct_button)
         action_row.addWidget(self._pause_button)
@@ -932,6 +1150,63 @@ class WordPycketApp:
         self._set_page(root)
         self._set_batch_idle()
         self._refresh_words(False)
+
+    def _upload_csv(self) -> None:
+        if self._csv_upload_handler is None:
+            QMessageBox.information(self._window, "无法上传 CSV", "当前未配置 CSV 导入器。")
+            return
+        file_name, _selected_filter = QFileDialog.getOpenFileName(
+            self._window,
+            "上传 CSV",
+            "",
+            "CSV 文件 (*.csv);;所有文件 (*)",
+        )
+        if not file_name:
+            return
+        source_path = Path(file_name)
+        try:
+            result = self._csv_upload_handler(source_path)
+        except Exception as error:
+            QMessageBox.critical(self._window, "CSV 上传失败", str(error))
+            return
+        self._study_session.clear_last_session()
+        self._study_session.reset()
+        self._selected_id = None
+        self._selected_ids = []
+        self._refresh_words(False)
+        QMessageBox.information(
+            self._window,
+            "CSV 上传完成",
+            f"当前 CSV：{result.csv_path.name}\n已自动识别语言：{result.language}。\n已导入或更新 {result.imported_count} 个词条。",
+        )
+
+    def _upload_pdf(self) -> None:
+        if self._pdf_import_loader is None:
+            QMessageBox.information(self._window, "无法上传 PDF", "当前未配置 PDF 解析器。")
+            return
+        file_name, _selected_filter = QFileDialog.getOpenFileName(
+            self._window,
+            "上传 PDF",
+            "",
+            "PDF 文件 (*.pdf);;所有文件 (*)",
+        )
+        if not file_name:
+            return
+        try:
+            result = self._pdf_import_loader(Path(file_name))
+        except Exception as error:
+            QMessageBox.critical(self._window, "PDF 解析失败", str(error))
+            return
+        self._study_session.clear_last_session()
+        self._study_session.reset()
+        self._selected_id = None
+        self._selected_ids = []
+        self._refresh_words(False)
+        QMessageBox.information(
+            self._window,
+            "PDF 解析完成",
+            f"已自动识别语言：{result.language}。\n已生成 {result.csv_path.name}，导入或更新 {result.imported_count} 个词条。",
+        )
 
     def _visible_word_entries(self, query: str = "") -> list[WordEntry]:
         if self._mode in {"learning", "review"}:
@@ -1373,10 +1648,11 @@ class WordPycketApp:
 
     def _apply_batch_result(self, entry: WordEntry, data: dict) -> None:
         if self._batch_action == "补充":
-            updated = self._service.update_examples(
+            updated = self._update_supplemented_entry(
                 entry.id,
                 str(data["example_sentence"]),
                 str(data["example_sentence_cn"]),
+                str(data.get("meaning", "")),
             )
         else:
             updated = self._service.update_text(
@@ -1387,6 +1663,31 @@ class WordPycketApp:
             )
         if updated is not None:
             self._batch_updated_ids.append(updated.id)
+
+    def _update_supplemented_entry(
+        self,
+        entry_id: str,
+        example_sentence: str,
+        example_sentence_cn: str,
+        meaning: str = "",
+    ) -> WordEntry | None:
+        entry = self._service.get_word(entry_id)
+        if entry is None:
+            return None
+        if not entry.meaning.strip() and meaning.strip():
+            updated = self._service.update_text(
+                entry.id,
+                entry.word,
+                meaning.strip(),
+                entry.forms,
+            )
+            if updated is None:
+                return None
+        return self._service.update_examples(
+            entry.id,
+            example_sentence,
+            example_sentence_cn,
+        )
 
     def _finish_isolated_batch(self) -> None:
         if self._batch_finished:
@@ -1443,7 +1744,12 @@ class WordPycketApp:
         for entry_id, first_value, second_value, third_value in updates:
             try:
                 if action == "补充":
-                    updated = self._service.update_examples(entry_id, first_value, second_value)
+                    updated = self._update_supplemented_entry(
+                        entry_id,
+                        first_value,
+                        second_value,
+                        third_value,
+                    )
                 else:
                     updated = self._service.update_text(entry_id, first_value, second_value, third_value)
                 if updated is not None:

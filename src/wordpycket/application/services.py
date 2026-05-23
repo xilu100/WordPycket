@@ -9,6 +9,9 @@ class WordService:
     def __init__(self, repository: WordRepository) -> None:
         self._repository = repository
 
+    def use_repository(self, repository: WordRepository) -> None:
+        self._repository = repository
+
     def add_word(
         self,
         word: str,

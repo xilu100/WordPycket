@@ -5,7 +5,9 @@ description = "A small desktop vocabulary app built with DDD onion architecture.
 requires-python = ">=3.10"
 dependencies = [
     "llama-cpp-python>=0.3.0",
+    "nltk>=3.8",
     "PySide6>=6.7",
+    "spacy>=3.7",
 ]
 
 [project.scripts]

@@ -30,9 +30,6 @@ class WordEntry:
 
         if not normalized_word:
             raise ValueError("单词不能为空。")
-        if not normalized_meaning:
-            raise ValueError("释义不能为空。")
-
         object.__setattr__(self, "word", normalized_word)
         object.__setattr__(self, "meaning", normalized_meaning)
         object.__setattr__(self, "forms", normalized_forms)

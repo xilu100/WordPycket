@@ -1,23 +1,76 @@
 # WordPycket
 
-一个使用 DDD 洋葱架构组织的 Python Qt GUI 小软件，用来从 CSV 导入词库，并按掌握程度进行单词复习。
+WordPycket 是一个本地运行的 Qt 桌面词汇学习工具。它可以从 CSV 导入词库，也可以从 PDF 自动解析词频并生成 CSV；学习进度、例句和词库数据都保存在项目目录内。
 
-数据层使用 Python 标准库内置的 SQLite，不需要额外安装数据库服务。SQLite 支持事务、索引、约束、视图、触发器、CTE、JSON 扩展等常见 SQL 能力，但它不是 PostgreSQL 的完整同等替代品；如果后续需要多用户并发、网络访问、复杂权限和 PostgreSQL 扩展，可以在 `infrastructure` 层替换仓储实现。
+## 普通用户使用
 
-## 页面
+最终用户不需要安装 Python、conda、pip、spaCy、NLTK 或 CUDA Toolkit。
 
-- 主页提供三个入口：`学习`、`复习`、`词表`。
+### Windows
+
+如果拿到的是发布版目录，双击：
+
+```text
+run.exe
+```
+
+如果是直接从源码仓库使用，双击：
+
+```text
+run.bat
+```
+
+`run.bat` 不会寻找或使用电脑上已有的 Python。它会先在项目目录内下载 `uv.exe`，再把完整 Python 安装到 `runtime/python/`，然后创建 `.venv/`、`model/` 和 `data/`，并自动配置环境后启动。
+
+### macOS
+
+如果是直接从源码仓库使用，双击：
+
+```text
+run.command
+```
+
+如果系统提示无法打开，先在终端进入项目目录执行一次：
+
+```bash
+chmod +x run.command
+```
+
+`run.command` 不会寻找或使用电脑上已有的 Python。它会先在项目目录内下载 `uv`，再把完整 Python 安装到 `runtime/python/`，然后创建 `.venv/`、`model/` 和 `data/`，并自动配置环境后启动。Apple Silicon 机器会优先配置 Metal 版 `llama-cpp-python`；其它机器使用 CPU。
+
+### 本地文件
+
+所有运行期文件都放在项目目录内：
+
+```text
+.venv/
+runtime/
+model/
+input/
+data/
+```
+
+删除整个项目文件夹后，不会留下 WordPycket 的数据库、模型或缓存。
+
+## 功能
+
+- 主页提供 `学习`、`复习`、`词表` 三个入口。
 - `学习` 页面只显示学习池中的单词卡片和操作按钮。
 - `复习` 页面只显示复习池中的单词卡片和操作按钮。
-- `词表` 页面显示完整词库，支持搜索、查看状态和删除选中词条。
+- `词表` 页面显示当前 CSV 的词库，支持通过管理弹窗选择/删除 CSV、上传 CSV、上传 PDF、搜索、查看状态和删除选中词条。
+- 智能补充/修正使用 `model/` 目录中的本地 `.gguf` 模型。
 
 ## 数据
 
-- 启动时读取 `input/word_frequency.csv`。
-- CSV 是只读词频来源，只读取 `Index`、`English`、`Chinese`、`Frequency`、`Forms`。
+- 启动时读取 `input/` 中当前选中的 CSV；`input/` 可以同时保存多个 CSV。
+- 上传 CSV 会先校验列名，通过后复制到 `input/` 并切换到该 CSV。上传 PDF 会自动解析并在 `input/` 中生成一个 CSV。
+- 每个 CSV 使用独立 SQLite 数据库保存学习进度和例句；切换 CSV 不会丢失其它 CSV 的数据库。删除 CSV 前会提示确认，确认后对应数据库会一起删除。
+- CSV 会自动检测列名语言，但列结构必须是固定的 5 列。例如英语是 `Index`、`English`、`Chinese`、`Frequency`、`Forms`；德语是 `Index`、`Deutsch`、`Chinesisch`、`Häufigkeit`、`Formen`。
+- 上传 PDF 会提取文本、自动识别语言、统计词频和固定词组频率，并生成同一套固定列结构的 CSV。扫描图片 PDF 需要先 OCR 成可复制文本。
+- PDF 词形归并强制使用语言库：英文需要 `nltk` 的 `wordnet` 数据，其它拉丁字母语言需要对应 spaCy 模型；缺少语言库时会提示安装。
 - SQLite 保存词条、例句、会/不会次数、复习时间和学习状态。
 - 正常启动会按 CSV 更新单词释义、频率和词形，不会清空已有例句或学习进度。
-- 主页的 `重置学习进度` 会清空数据库词条，然后从 CSV 重新导入；这会删除所有学习记录、例句和不在 CSV 中的词条。
+- `重置学习进度` 会保留 `Index`、英文、中文、频率、词形、例句和例句中文；其它学习进度字段会清零。
 
 ## 学习规则
 
@@ -45,47 +98,6 @@
 - 浏览历史词时不显示 `不会`、`会`、`绝对会`，避免重复计数。
 - 在历史末尾点击 `下一个`，会继续抽取本次会话中还没有显示过的新词。
 
-## 运行
-
-安装依赖：
-
-```powershell
-pip install -r requirements-windows.txt
-```
-
-macOS：
-
-```bash
-pip install -r requirements-macos.txt
-```
-
-Windows NVIDIA CUDA 可选加速：
-
-```powershell
-pip install -r requirements-windows.txt
-$env:CMAKE_ARGS="-DGGML_CUDA=on"
-$env:FORCE_CMAKE="1"
-pip install --upgrade --force-reinstall --no-cache-dir llama-cpp-python
-```
-
-macOS Apple Metal 可选加速：
-
-```bash
-pip install -r requirements-macos.txt
-CMAKE_ARGS="-DGGML_METAL=on" FORCE_CMAKE=1 \
-  pip install --upgrade --force-reinstall --no-cache-dir llama-cpp-python
-```
-
-```powershell
-python -m wordpycket.main
-```
-
-如果没有安装为包，请在项目根目录使用：
-
-```powershell
-$env:PYTHONPATH="src"; python -m wordpycket.main
-```
-
 ## 本地模型
 
 - 智能补充/修正使用 `model/` 目录中的 `.gguf` 模型。
@@ -95,11 +107,102 @@ $env:PYTHONPATH="src"; python -m wordpycket.main
 - 如果用户自行放入 `.gguf` 模型，软件会优先使用用户模型，并在智能功能启动前提示兼容性不保证。
 - 默认模型来源：Hugging Face `Qwen/Qwen2.5-3B-Instruct-GGUF`。
 
+## 维护者构建
+
+以下步骤只给维护者/发布者使用，普通用户不需要执行。
+
+先创建构建环境：
+
+```powershell
+python scripts/setup_env.py
+```
+
+脚本会自动检测 NVIDIA CUDA、macOS Apple Metal/MPS 和 CPU，并优先安装 `llama-cpp-python` 的预编译 CUDA/Metal wheel。没有可用 GPU/驱动，或没有匹配 wheel 时会使用 CPU；项目不能在没有 NVIDIA GPU 和驱动的机器上凭空提供可用 CUDA。
+
+只安装部分 spaCy 模型可用：
+
+```powershell
+python scripts/setup_env.py --spacy-models en,de
+```
+
+强制 CUDA 或 Metal，失败时不回退：
+
+```powershell
+python scripts/setup_env.py --device cuda --strict-accel
+python scripts/setup_env.py --device mps --strict-accel
+```
+
+构建便携版：
+
+```powershell
+.\.venv\Scripts\python.exe scripts\build_portable.py --name run --include-input --include-model
+```
+
+macOS 上使用：
+
+```bash
+./.venv/bin/python scripts/build_portable.py --name run --include-input --include-model
+```
+
+也可以直接一键创建/更新构建环境并打包：
+
+```powershell
+python scripts/release_portable.py --name run
+```
+
+构建完成后分发整个目录，不要只发 exe：
+
+```text
+dist/run/
+```
+
+Windows 用户运行：
+
+```text
+dist/run/run.exe
+```
+
+macOS 用户需要在 macOS 上构建后运行对应的 `dist/run/run` 或 `.app` 包；Windows 构建物不能替代 macOS Metal 版本。
+
+## 手动开发安装
+
+一般不需要，除非你在调试依赖。
+
+Windows：
+
+```powershell
+pip install -e .
+python -m nltk.downloader wordnet omw-1.4
+python -m spacy download en_core_web_sm
+python -m spacy download de_core_news_sm
+```
+
+macOS：
+
+```bash
+pip install -e .
+python -m nltk.downloader wordnet omw-1.4
+python -m spacy download en_core_web_sm
+python -m spacy download de_core_news_sm
+```
+
+维护者本地直接运行：
+
+```powershell
+.\.venv\Scripts\python.exe -m wordpycket.main
+```
+
+macOS：
+
+```bash
+./.venv/bin/python -m wordpycket.main
+```
+
 ## 架构
 
 - `domain`：领域实体和仓储接口，不依赖外层实现。
 - `application`：应用服务，编排用例。
-- `infrastructure`：SQLite 仓储实现和 CSV 导入器。
-- `presentation`：GUI 展示层。当前入口使用 Qt 实现 `qt_app.py`；Tkinter 版本仍保留在 `tk_app.py` 作为稳定回退。
+- `infrastructure`：SQLite 仓储实现、CSV 导入、PDF 解析和本地模型调用。
+- `presentation`：Qt GUI 展示层。
 
 依赖方向为：`presentation -> application -> domain`，`infrastructure -> domain`。

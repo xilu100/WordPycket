@@ -44,6 +44,65 @@ def test_isolated_generation_reads_child_json(monkeypatch: pytest.MonkeyPatch) -
 
     assert result.example_sentence == "Vectors represent direction."
     assert result.example_sentence_cn == "向量表示方向。"
+    assert result.meaning == ""
+
+
+def test_isolated_generation_can_fill_empty_chinese_meaning(monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = []
+
+    def fake_run(*_args, **kwargs):
+        payloads.append(json.loads(kwargs["input"]))
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps(
+                {
+                    "example_sentence": "A kernel manages system resources.",
+                    "example_sentence_cn": "内核管理系统资源。",
+                    "meaning": "内核",
+                },
+                ensure_ascii=False,
+            ),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    generator = LocalLlmExampleGenerator(model_dir=__file__)
+
+    result = generator.generate_isolated(WordEntry(word="kernel", meaning=""))
+
+    assert payloads[0]["entry"]["meaning"] == ""
+    assert result.example_sentence == "A kernel manages system resources."
+    assert result.example_sentence_cn == "内核管理系统资源。"
+    assert result.meaning == "内核"
+
+
+def test_generation_requires_chinese_meaning_only_when_entry_meaning_is_empty(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLlm:
+        def create_chat_completion(self, **_kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "example_sentence": "A kernel manages resources.",
+                                    "example_sentence_cn": "内核管理资源。",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: FakeLlm())
+
+    with pytest.raises(RuntimeError, match="中文释义"):
+        generator.generate(WordEntry(word="kernel", meaning=""))
 
 
 def test_isolated_generation_reports_child_crash(monkeypatch: pytest.MonkeyPatch) -> None:
