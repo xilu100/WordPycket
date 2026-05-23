@@ -2,6 +2,8 @@ $ErrorActionPreference = "Stop"
 
 $Root = Split-Path -Parent $MyInvocation.MyCommand.Path
 $RuntimeDir = Join-Path $Root "runtime"
+$LogDir = Join-Path $Root "logs"
+$LogFile = Join-Path $LogDir ("wordpycket-{0}.log" -f (Get-Date -Format "yyyyMMdd-HHmmss"))
 $UvDir = Join-Path $RuntimeDir "uv"
 $UvExe = Join-Path $UvDir "uv.exe"
 $UvZip = Join-Path $RuntimeDir "uv.zip"
@@ -11,6 +13,14 @@ $PythonVersion = "3.11"
 $VenvPath = Join-Path $Root ".venv"
 $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
 $SetupMarker = Join-Path $RuntimeDir ".setup-complete"
+
+$TranscriptStarted = $false
+$ExitCode = 0
+New-Item -ItemType Directory -Force -Path $LogDir | Out-Null
+try {
+    Start-Transcript -Path $LogFile -Force | Out-Null
+    $TranscriptStarted = $true
+    Write-Host "WordPycket startup log: $LogFile"
 
 $env:PIP_CACHE_DIR = Join-Path $Root "runtime\cache\pip"
 $env:HF_HOME = Join-Path $Root "runtime\cache\huggingface"
@@ -90,3 +100,17 @@ if ($NeedsSetup) {
 }
 
 Invoke-NativeChecked $VenvPython "-m" "wordpycket.main"
+} catch {
+    $ExitCode = 1
+    Write-Host ""
+    Write-Host "WordPycket failed to start."
+    Write-Host "Startup log saved to: $LogFile"
+    Write-Host ""
+    Write-Error $_
+} finally {
+    if ($TranscriptStarted) {
+        Stop-Transcript | Out-Null
+    }
+}
+
+exit $ExitCode

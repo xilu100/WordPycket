@@ -3,6 +3,8 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "$0")" && pwd)"
 RUNTIME_DIR="$ROOT/runtime"
+LOG_DIR="$ROOT/logs"
+LOG_FILE="$LOG_DIR/wordpycket-$(date +%Y%m%d-%H%M%S).log"
 UV_DIR="$RUNTIME_DIR/uv"
 UV_EXE="$UV_DIR/uv"
 UV_ARCHIVE="$RUNTIME_DIR/uv.tar.gz"
@@ -12,6 +14,11 @@ VENV_PATH="$ROOT/.venv"
 VENV_PYTHON="$VENV_PATH/bin/python"
 SETUP_MARKER="$RUNTIME_DIR/.setup-complete"
 
+mkdir -p "$LOG_DIR"
+exec > >(tee -a "$LOG_FILE") 2>&1
+trap 'status=$?; if [ "$status" -ne 0 ]; then echo; echo "WordPycket failed to start."; echo "Startup log saved to: $LOG_FILE"; fi' EXIT
+echo "WordPycket startup log: $LOG_FILE"
+
 export PIP_CACHE_DIR="$RUNTIME_DIR/cache/pip"
 export HF_HOME="$RUNTIME_DIR/cache/huggingface"
 export XDG_CACHE_HOME="$RUNTIME_DIR/cache"
@@ -20,6 +27,11 @@ export UV_CACHE_DIR="$RUNTIME_DIR/cache/uv"
 export UV_PYTHON_INSTALL_DIR="$PYTHON_INSTALL_DIR"
 export UV_PYTHON_PREFERENCE="only-managed"
 export UV_PROJECT_ENVIRONMENT="$VENV_PATH"
+if [ -n "${PYTHONPATH:-}" ]; then
+    export PYTHONPATH="$ROOT/src:$PYTHONPATH"
+else
+    export PYTHONPATH="$ROOT/src"
+fi
 
 mkdir -p "$PIP_CACHE_DIR" "$HF_HOME" "$NLTK_DATA" "$UV_CACHE_DIR" "$UV_DIR"
 mkdir -p "$ROOT/input" "$ROOT/model" "$ROOT/data/csv_databases"
