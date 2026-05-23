@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import subprocess
+import sys
+from types import SimpleNamespace
 from io import BytesIO
 from pathlib import Path
 
@@ -140,3 +142,95 @@ def test_model_dir_rejects_multiple_gguf_files(tmp_path: Path) -> None:
 
     with pytest.raises(RuntimeError, match="只能存在一个 .gguf"):
         generator._ensure_model_path()
+
+
+def test_device_status_selects_cuda_when_available(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "llama_cpp",
+        SimpleNamespace(llama_supports_gpu_offload=lambda: True),
+    )
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_detect_accelerator", lambda: generator._CUDA_DEVICE)
+
+    status = generator.device_status()
+
+    assert status.detected == "cuda"
+    assert status.selected == "cuda"
+    assert status.gpu_offload_supported is True
+    assert status.error == ""
+
+
+def test_device_status_falls_back_to_cpu_without_gpu_offload(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setitem(
+        sys.modules,
+        "llama_cpp",
+        SimpleNamespace(llama_supports_gpu_offload=lambda: False),
+    )
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_detect_accelerator", lambda: generator._CUDA_DEVICE)
+
+    status = generator.device_status()
+
+    assert status.detected == "cuda"
+    assert status.selected == "cpu"
+    assert status.gpu_offload_supported is False
+    assert status.error == ""
+
+
+def test_smoke_test_uses_isolated_worker(monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = []
+
+    def fake_run(*_args, **kwargs):
+        payloads.append(json.loads(kwargs["input"]))
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"ok": True}),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    generator = LocalLlmExampleGenerator(Path("model"))
+
+    generator.run_smoke_test_isolated()
+
+    assert payloads[0]["action"] == "smoke_test"
+
+
+def test_check_model_runtime_runs_smoke_test(monkeypatch: pytest.MonkeyPatch) -> None:
+    generator = LocalLlmExampleGenerator(Path("model"))
+    model_path = Path("model") / LocalLlmExampleGenerator.DEFAULT_MODEL_FILENAME
+    monkeypatch.setattr(
+        generator,
+        "ensure_model_available",
+        lambda: type("Status", (), {"path": model_path, "is_user_model": False, "downloaded": False})(),
+    )
+    monkeypatch.setattr(
+        generator,
+        "device_status",
+        lambda: type(
+            "Device",
+            (),
+            {
+                "requested": "auto",
+                "detected": "cpu",
+                "selected": "cpu",
+                "gpu_offload_supported": False,
+                "error": "",
+            },
+        )(),
+    )
+    smoke_calls = []
+    monkeypatch.setattr(generator, "run_smoke_test_isolated", lambda: smoke_calls.append(True))
+
+    result = generator.check_model_runtime()
+
+    assert result.model.path == model_path
+    assert result.device.selected == "cpu"
+    assert result.smoke_test_passed is True
+    assert smoke_calls == [True]

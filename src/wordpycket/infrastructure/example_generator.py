@@ -67,6 +67,22 @@ class ModelStatus:
     downloaded: bool = False
 
 
+@dataclass(frozen=True)
+class DeviceStatus:
+    requested: str
+    detected: str
+    selected: str | None
+    gpu_offload_supported: bool | None
+    error: str = ""
+
+
+@dataclass(frozen=True)
+class ModelCheckResult:
+    model: ModelStatus
+    device: DeviceStatus
+    smoke_test_passed: bool
+
+
 class LocalLlmExampleGenerator:
     DEFAULT_MODEL_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
     DEFAULT_MODEL_FILENAME = "qwen2.5-3b-instruct-q4_k_m.gguf"
@@ -155,6 +171,58 @@ class LocalLlmExampleGenerator:
             )
         model_path = self._download_default_model()
         return ModelStatus(path=model_path, is_user_model=False, downloaded=True)
+
+    def device_status(self) -> DeviceStatus:
+        requested = os.getenv("WORDPYCKET_LLM_DEVICE", self._AUTO_DEVICE).lower()
+        detected = self._detect_accelerator()
+        try:
+            from llama_cpp import llama_supports_gpu_offload
+        except ImportError:
+            return DeviceStatus(
+                requested=requested,
+                detected=detected,
+                selected=None,
+                gpu_offload_supported=None,
+                error="缺少 llama-cpp-python。",
+            )
+
+        try:
+            supports_gpu_offload = bool(llama_supports_gpu_offload())
+            selected = self._select_device(supports_gpu_offload)
+        except Exception as error:
+            return DeviceStatus(
+                requested=requested,
+                detected=detected,
+                selected=None,
+                gpu_offload_supported=None,
+                error=str(error),
+            )
+        return DeviceStatus(
+            requested=requested,
+            detected=detected,
+            selected=selected,
+            gpu_offload_supported=supports_gpu_offload,
+        )
+
+    def check_model_runtime(self) -> ModelCheckResult:
+        model = self.ensure_model_available()
+        device = self.device_status()
+        if device.error:
+            raise RuntimeError(f"设备检查失败：{device.error}")
+        self.run_smoke_test_isolated()
+        return ModelCheckResult(model=model, device=device, smoke_test_passed=True)
+
+    def run_smoke_test_isolated(self) -> None:
+        if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
+            self._run_smoke_test()
+            return
+        data = self._run_isolated_worker(
+            "smoke_test",
+            WordEntry(word="test", meaning="测试"),
+            "",
+        )
+        if data.get("ok") is not True:
+            raise RuntimeError(f"模型最小执行测试返回异常：{data}")
 
     def _run_isolated_worker(
         self,
@@ -638,6 +706,39 @@ class LocalLlmExampleGenerator:
             )
             return LocalLlmExampleGenerator._extract_completion_text(response)
 
+    def _run_smoke_test(self) -> None:
+        llm = self._load_model(0)
+        content = self._call_smoke_model(llm)
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"模型最小执行测试返回内容不是有效 JSON：{content}") from error
+        if not isinstance(data, dict) or data.get("ok") is not True:
+            raise RuntimeError(f"模型最小执行测试返回异常：{content}")
+
+    @staticmethod
+    def _call_smoke_model(llm: Any) -> str:
+        messages = [
+            {"role": "system", "content": "Return only valid JSON."},
+            {"role": "user", "content": 'Return exactly {"ok": true}.'},
+        ]
+        try:
+            response = llm.create_chat_completion(
+                messages=messages,
+                temperature=0,
+                max_tokens=16,
+                response_format={"type": "json_object"},
+            )
+            return LocalLlmExampleGenerator._extract_chat_content(response)
+        except (KeyError, TypeError, ValueError, AttributeError):
+            response = llm.create_completion(
+                prompt='Return only valid JSON.\n\nReturn exactly {"ok": true}.\n\nJSON:',
+                temperature=0,
+                max_tokens=16,
+                stop=["\n\n"],
+            )
+            return LocalLlmExampleGenerator._extract_completion_text(response)
+
     @staticmethod
     def _extract_chat_content(response: Any) -> str:
         choices = response["choices"]
@@ -880,6 +981,9 @@ def _main() -> None:
             "corrected_word": corrected.corrected_word,
             "note": corrected.note,
         }
+    elif action == "smoke_test":
+        generator._run_smoke_test()
+        result = {"ok": True}
     else:
         raise RuntimeError(f"未知智能任务：{action}")
     print(json.dumps(result, ensure_ascii=False), flush=True)

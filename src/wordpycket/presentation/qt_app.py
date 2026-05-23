@@ -72,6 +72,10 @@ class ExampleGenerator(Protocol):
 
     def ensure_model_available(self): ...
 
+    def device_status(self): ...
+
+    def check_model_runtime(self): ...
+
     def recommended_process_parallelism(self) -> int: ...
 
     def isolated_command(self) -> list[str]: ...
@@ -588,37 +592,82 @@ class WordPycketApp:
             return f"智能模型：配置需要处理。{error}"
         path = getattr(status, "path", None)
         if path is None:
-            return "智能模型：未找到。可点击检查模型下载默认 Hugging Face 模型；不影响普通学习和复习。"
+            return (
+                "智能模型：未找到。可点击检查模型下载默认 Hugging Face 模型；不影响普通学习和复习。"
+                f"\n{self._device_status_text()}"
+            )
         if getattr(status, "is_user_model", False):
-            return f"智能模型：使用自带模型 {path.name}。不保证完全兼容。"
-        return f"智能模型：使用默认模型 {path.name}。"
+            model_text = f"智能模型：使用自带模型 {path.name}。不保证完全兼容。"
+        else:
+            model_text = f"智能模型：使用默认模型 {path.name}。"
+        return f"{model_text}\n{self._device_status_text()}"
+
+    def _device_status_text(self) -> str:
+        if self._example_generator is None:
+            return "Device：未配置。"
+        if not hasattr(self._example_generator, "device_status"):
+            return "Device：当前生成器不支持设备检查。"
+        try:
+            status = self._example_generator.device_status()
+        except Exception as error:
+            return f"Device：检查失败。{error}"
+        detected = self._device_label(getattr(status, "detected", "cpu"))
+        selected = getattr(status, "selected", None)
+        error = getattr(status, "error", "")
+        if error:
+            return f"Device：检测到 {detected}，当前不可用。{error}"
+        return f"Device：检测到 {detected}，将使用 {self._device_label(selected)}。"
+
+    @staticmethod
+    def _device_label(device: str | None) -> str:
+        labels = {
+            "cuda": "CUDA",
+            "mps": "Metal",
+            "cpu": "CPU",
+            "auto": "Auto",
+            None: "未知",
+        }
+        return labels.get(device, str(device).upper())
 
     def _check_model(self) -> None:
         if self._example_generator is None:
             QMessageBox.information(self._window, "模型检查", "未配置本地模型生成器。")
             return
-        if not hasattr(self._example_generator, "ensure_model_available"):
+        if not hasattr(self._example_generator, "check_model_runtime"):
             QMessageBox.information(self._window, "模型检查", "当前生成器不支持模型检查。")
             return
         try:
-            status = self._example_generator.ensure_model_available()
+            result = self._example_generator.check_model_runtime()
         except Exception as error:
             QMessageBox.critical(self._window, "模型检查失败", str(error))
             self._show_home()
             return
+        status = result.model
+        device = result.device
         path = getattr(status, "path", None)
+        device_line = f"\nDevice：{self._device_label(getattr(device, 'selected', None))}"
+        smoke_line = "\n最小执行测试：通过。"
         if path is None:
             QMessageBox.information(self._window, "模型检查", "未找到可用模型。")
         elif getattr(status, "is_user_model", False):
             QMessageBox.warning(
                 self._window,
                 "模型检查",
-                f"当前使用自带模型：{path.name}\n不保证提示词格式、JSON 输出稳定性和 llama.cpp 兼容性。",
+                f"当前使用自带模型：{path.name}"
+                f"{device_line}{smoke_line}\n不保证提示词格式、JSON 输出稳定性和 llama.cpp 兼容性。",
             )
         elif getattr(status, "downloaded", False):
-            QMessageBox.information(self._window, "模型检查", f"默认模型已下载：{path.name}")
+            QMessageBox.information(
+                self._window,
+                "模型检查",
+                f"默认模型已下载：{path.name}{device_line}{smoke_line}",
+            )
         else:
-            QMessageBox.information(self._window, "模型检查", f"默认模型已就绪：{path.name}")
+            QMessageBox.information(
+                self._window,
+                "模型检查",
+                f"默认模型已就绪：{path.name}{device_line}{smoke_line}",
+            )
         self._show_home()
 
     def _confirm_reset_progress(self) -> None:
