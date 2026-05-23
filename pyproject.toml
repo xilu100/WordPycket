@@ -1,7 +1,7 @@
 [project]
 name = "wordpycket"
 version = "0.1.0"
-description = "A small Qt desktop app built with DDD onion architecture."
+description = "A small desktop vocabulary app built with DDD onion architecture."
 requires-python = ">=3.10"
 dependencies = [
     "llama-cpp-python>=0.3.0",

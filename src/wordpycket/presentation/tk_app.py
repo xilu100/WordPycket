@@ -313,11 +313,11 @@ class GlassButton(tk.Canvas):
 class ExampleGenerator(Protocol):
     def generate(self, entry: WordEntry, scope: str = ""): ...
 
+    def generate_isolated(self, entry: WordEntry, scope: str = ""): ...
+
     def correct_entry(self, entry: WordEntry, scope: str = ""): ...
 
-    def generate_many(self, entries: list[WordEntry], scope: str = "", progress=None, control=None): ...
-
-    def correct_many(self, entries: list[WordEntry], scope: str = "", progress=None, control=None): ...
+    def correct_entry_isolated(self, entry: WordEntry, scope: str = ""): ...
 
 
 class WordPycketApp:
@@ -865,26 +865,20 @@ class WordPycketApp:
                 ),
             )
 
-        try:
-            if hasattr(self._example_generator, "correct_many"):
-                results, errors, _workers = self._example_generator.correct_many(
-                    entries,
-                    scope=scope,
-                    progress=progress,
-                    control=self._batch_control_state,
-                )
-            else:
-                results = []
-                for index, entry in enumerate(entries, start=1):
-                    if not self._wait_for_batch_resume():
-                        break
-                    progress(index - 1, total, 1)
-                    results.append((entry, self._example_generator.correct_entry(entry, scope)))
-                progress(total, total, 1)
-        except Exception as error:
-            message = str(error)
-            self._root.after(0, lambda: self._on_correct_entry_failed(message))
-            return
+        results = []
+        for index, entry in enumerate(entries, start=1):
+            if not self._wait_for_batch_resume():
+                break
+            progress(index - 1, total, 1)
+            try:
+                if hasattr(self._example_generator, "correct_entry_isolated"):
+                    corrected = self._example_generator.correct_entry_isolated(entry, scope)
+                else:
+                    corrected = self._example_generator.correct_entry(entry, scope)
+                results.append((entry, corrected))
+            except Exception as error:
+                errors.append(f"{entry.word}: {error}")
+        progress(total, total, 1)
 
         for entry, corrected in results:
             try:
@@ -1225,26 +1219,20 @@ class WordPycketApp:
                 ),
             )
 
-        try:
-            if hasattr(self._example_generator, "generate_many"):
-                results, errors, _workers = self._example_generator.generate_many(
-                    entries,
-                    scope=scope,
-                    progress=progress,
-                    control=self._batch_control_state,
-                )
-            else:
-                results = []
-                for index, entry in enumerate(entries, start=1):
-                    if not self._wait_for_batch_resume():
-                        break
-                    progress(index - 1, total, 1)
-                    results.append((entry, self._example_generator.generate(entry, scope)))
-                progress(total, total, 1)
-        except Exception as error:
-            message = str(error)
-            self._root.after(0, lambda: self._on_generate_example_failed(message))
-            return
+        results = []
+        for index, entry in enumerate(entries, start=1):
+            if not self._wait_for_batch_resume():
+                break
+            progress(index - 1, total, 1)
+            try:
+                if hasattr(self._example_generator, "generate_isolated"):
+                    generated = self._example_generator.generate_isolated(entry, scope)
+                else:
+                    generated = self._example_generator.generate(entry, scope)
+                results.append((entry, generated))
+            except Exception as error:
+                errors.append(f"{entry.word}: {error}")
+        progress(total, total, 1)
 
         for entry, generated in results:
             try:

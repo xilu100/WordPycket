@@ -1,9 +1,10 @@
+import os
 import sys
 import time
 from collections.abc import Callable
 from typing import Protocol
 
-from PySide6.QtCore import QObject, Qt, QThread, Signal
+from PySide6.QtCore import QObject, QItemSelectionModel, QProcess, QProcessEnvironment, Qt, QThread, QTimer, Signal
 from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QApplication,
@@ -18,6 +19,7 @@ from PySide6.QtWidgets import (
     QLineEdit,
     QMainWindow,
     QMessageBox,
+    QInputDialog,
     QPlainTextEdit,
     QProgressBar,
     QPushButton,
@@ -54,11 +56,31 @@ def _font_config() -> dict[str, str]:
 class ExampleGenerator(Protocol):
     def generate(self, entry: WordEntry, scope: str = ""): ...
 
+    def generate_isolated(self, entry: WordEntry, scope: str = ""): ...
+
     def correct_entry(self, entry: WordEntry, scope: str = ""): ...
+
+    def correct_entry_isolated(self, entry: WordEntry, scope: str = ""): ...
 
     def generate_many(self, entries: list[WordEntry], scope: str = "", progress=None, control=None): ...
 
     def correct_many(self, entries: list[WordEntry], scope: str = "", progress=None, control=None): ...
+
+    def uses_user_model(self) -> bool: ...
+
+    def model_status(self): ...
+
+    def ensure_model_available(self): ...
+
+    def recommended_process_parallelism(self) -> int: ...
+
+    def isolated_command(self) -> list[str]: ...
+
+    def isolated_environment(self) -> dict[str, str]: ...
+
+    def isolated_payload(self, action: str, entry: WordEntry, scope: str) -> str: ...
+
+    def parse_isolated_result(self, stdout: str, stderr: str, returncode: int) -> dict: ...
 
 
 class BatchWorker(QObject):
@@ -72,7 +94,6 @@ class BatchWorker(QObject):
         entries: list[WordEntry],
         scope: str,
         generator: ExampleGenerator,
-        service: WordService,
         control: Callable[[], str],
     ) -> None:
         super().__init__()
@@ -80,11 +101,10 @@ class BatchWorker(QObject):
         self._entries = entries
         self._scope = scope
         self._generator = generator
-        self._service = service
         self._control = control
 
     def run(self) -> None:
-        updated_ids: list[str] = []
+        updates: list[tuple[str, str, str, str]] = []
         errors: list[str] = []
         total = len(self._entries)
         started_at = time.monotonic()
@@ -96,73 +116,68 @@ class BatchWorker(QObject):
             if self._action == "补充":
                 results, errors, _workers = self._generate(progress)
                 for entry, generated in results:
-                    try:
-                        updated = self._service.update_examples(
+                    updates.append(
+                        (
                             entry.id,
                             generated.example_sentence,
                             generated.example_sentence_cn,
+                            "",
                         )
-                        if updated is not None:
-                            updated_ids.append(updated.id)
-                    except Exception as error:
-                        errors.append(f"{entry.word}: {error}")
+                    )
             else:
                 results, errors, _workers = self._correct(progress)
                 for entry, corrected in results:
-                    try:
-                        updated = self._service.update_text(
+                    updates.append(
+                        (
                             entry.id,
                             corrected.corrected_word,
                             entry.meaning,
                             entry.forms,
                         )
-                        if updated is not None:
-                            updated_ids.append(updated.id)
-                    except Exception as error:
-                        errors.append(f"{entry.word}: {error}")
+                    )
         except Exception as error:
             self.failed.emit(self._action, str(error))
             return
 
-        self.finished.emit(self._action, updated_ids, errors, total)
+        self.finished.emit(self._action, updates, errors, total)
 
     def _generate(self, progress):
-        if hasattr(self._generator, "generate_many"):
-            return self._generator.generate_many(
-                self._entries,
-                scope=self._scope,
-                progress=progress,
-                control=self._control,
-            )
-
         results = []
+        errors = []
         total = len(self._entries)
         for index, entry in enumerate(self._entries, start=1):
             if not self._wait_for_resume():
                 break
             progress(index - 1, total, 1)
-            results.append((entry, self._generator.generate(entry, self._scope)))
+            try:
+                if hasattr(self._generator, "generate_isolated"):
+                    generated = self._generator.generate_isolated(entry, self._scope)
+                else:
+                    generated = self._generator.generate(entry, self._scope)
+                results.append((entry, generated))
+            except Exception as error:
+                errors.append(f"{entry.word}: {error}")
         progress(total, total, 1)
-        return results, [], 1
+        return results, errors, 1
 
     def _correct(self, progress):
-        if hasattr(self._generator, "correct_many"):
-            return self._generator.correct_many(
-                self._entries,
-                scope=self._scope,
-                progress=progress,
-                control=self._control,
-            )
-
         results = []
+        errors = []
         total = len(self._entries)
         for index, entry in enumerate(self._entries, start=1):
             if not self._wait_for_resume():
                 break
             progress(index - 1, total, 1)
-            results.append((entry, self._generator.correct_entry(entry, self._scope)))
+            try:
+                if hasattr(self._generator, "correct_entry_isolated"):
+                    corrected = self._generator.correct_entry_isolated(entry, self._scope)
+                else:
+                    corrected = self._generator.correct_entry(entry, self._scope)
+                results.append((entry, corrected))
+            except Exception as error:
+                errors.append(f"{entry.word}: {error}")
         progress(total, total, 1)
-        return results, [], 1
+        return results, errors, 1
 
     def _wait_for_resume(self) -> bool:
         while self._control() == "paused":
@@ -187,6 +202,19 @@ class WordPycketApp:
         self._batch_state = "idle"
         self._batch_thread: QThread | None = None
         self._batch_worker: BatchWorker | None = None
+        self._batch_processes: dict[QProcess, WordEntry] = {}
+        self._batch_handled_processes: set[QProcess] = set()
+        self._batch_action = ""
+        self._batch_scope = ""
+        self._batch_entries: list[WordEntry] = []
+        self._batch_index = 0
+        self._batch_completed_count = 0
+        self._batch_finished = False
+        self._batch_started_at = 0.0
+        self._batch_updated_ids: list[str] = []
+        self._batch_errors: list[str] = []
+        self._pending_batch_message: tuple[str, str, str] | None = None
+        self._user_model_warning_shown = False
 
         self._app = QApplication.instance() or QApplication(sys.argv)
         self._window = QMainWindow()
@@ -216,6 +244,9 @@ class WordPycketApp:
         self._example_label: QLabel | None = None
         self._example_cn_label: QLabel | None = None
         self._review_meta_label: QLabel | None = None
+        self._study_card: QFrame | None = None
+        self._reveal_translation = False
+        self._current_card_state: StudyCardState | None = None
 
         self._show_home()
 
@@ -317,10 +348,13 @@ class WordPycketApp:
                 max-width: 36px;
                 min-height: 36px;
                 max-height: 36px;
-                padding: 0;
+                padding: 0 0 3px 0;
                 font-family: {fonts["icon_stack"]};
-                font-size: 26px;
+                font-size: 24px;
                 font-weight: 400;
+            }}
+            QPushButton[variant="icon"]:pressed {{
+                padding: 0 0 3px 0;
             }}
             QLineEdit, QPlainTextEdit {{
                 background: rgba(255, 255, 255, 178);
@@ -329,13 +363,58 @@ class WordPycketApp:
                 padding: 8px 10px;
                 selection-background-color: #d8ebff;
             }}
+            QMessageBox {{
+                background: #f7fbff;
+                color: #172033;
+            }}
+            QMessageBox QLabel {{
+                background: transparent;
+                color: #172033;
+            }}
+            QMessageBox QPushButton {{
+                background: #eef5ff;
+                color: #172033;
+                border: 1px solid #d8e4f2;
+                border-radius: 12px;
+                padding: 7px 18px;
+                min-width: 72px;
+                min-height: 22px;
+            }}
+            QMessageBox QPushButton:hover {{
+                background: #e2efff;
+            }}
+            QMessageBox QPushButton:pressed {{
+                background: #d8ebff;
+            }}
             QTableWidget {{
                 background: rgba(255, 255, 255, 172);
                 border: 1px solid rgba(255, 255, 255, 210);
                 border-radius: 22px;
-                gridline-color: rgba(237, 242, 248, 150);
-                selection-background-color: #d8ebff;
+                gridline-color: rgba(225, 233, 244, 120);
+                alternate-background-color: rgba(247, 250, 255, 118);
+                selection-background-color: rgba(212, 226, 244, 178);
                 selection-color: #172033;
+            }}
+            QTableWidget::item {{
+                border: none;
+                padding: 2px 6px;
+            }}
+            QTableWidget::item:hover {{
+                background: rgba(235, 243, 253, 130);
+            }}
+            QTableWidget::item:selected {{
+                background: rgba(212, 226, 244, 178);
+                color: #172033;
+                border-top: 1px solid rgba(169, 194, 224, 100);
+                border-bottom: 1px solid rgba(169, 194, 224, 100);
+            }}
+            QTableWidget::item:selected:active,
+            QTableWidget::item:selected:!active {{
+                background: rgba(212, 226, 244, 178);
+                color: #172033;
+            }}
+            QTableWidget::item:focus {{
+                outline: none;
             }}
             QHeaderView::section {{
                 background: rgba(238, 244, 252, 185);
@@ -463,6 +542,7 @@ class WordPycketApp:
         cards.addWidget(self._home_card("复习", f"{counts['review']} 个单词", "进入复习", lambda: self._show_mode("review")))
         cards.addWidget(self._home_card("词表", f"{counts['total']} 个单词", "查看词表", self._show_word_list))
         layout.addLayout(cards, 1)
+        layout.addWidget(self._model_status_panel())
 
         footer = QHBoxLayout()
         footer.addStretch()
@@ -484,7 +564,75 @@ class WordPycketApp:
         layout.addWidget(self._button(action, callback, "primary"))
         return card
 
+    def _model_status_panel(self) -> QFrame:
+        panel = self._panel()
+        layout = QHBoxLayout(panel)
+        layout.setContentsMargins(20, 16, 20, 16)
+        layout.setSpacing(14)
+
+        text = QLabel(self._model_status_text())
+        text.setObjectName("meta")
+        text.setWordWrap(True)
+        layout.addWidget(text, 1)
+        layout.addWidget(self._button("检查模型", self._check_model, "primary"))
+        return panel
+
+    def _model_status_text(self) -> str:
+        if self._example_generator is None:
+            return "智能模型：未配置。学习和复习可正常使用，智能补充/修正不可用。"
+        if not hasattr(self._example_generator, "model_status"):
+            return "智能模型：当前生成器不支持模型状态检查。"
+        try:
+            status = self._example_generator.model_status()
+        except Exception as error:
+            return f"智能模型：配置需要处理。{error}"
+        path = getattr(status, "path", None)
+        if path is None:
+            return "智能模型：未找到。可点击检查模型下载默认 Hugging Face 模型；不影响普通学习和复习。"
+        if getattr(status, "is_user_model", False):
+            return f"智能模型：使用自带模型 {path.name}。不保证完全兼容。"
+        return f"智能模型：使用默认模型 {path.name}。"
+
+    def _check_model(self) -> None:
+        if self._example_generator is None:
+            QMessageBox.information(self._window, "模型检查", "未配置本地模型生成器。")
+            return
+        if not hasattr(self._example_generator, "ensure_model_available"):
+            QMessageBox.information(self._window, "模型检查", "当前生成器不支持模型检查。")
+            return
+        try:
+            status = self._example_generator.ensure_model_available()
+        except Exception as error:
+            QMessageBox.critical(self._window, "模型检查失败", str(error))
+            self._show_home()
+            return
+        path = getattr(status, "path", None)
+        if path is None:
+            QMessageBox.information(self._window, "模型检查", "未找到可用模型。")
+        elif getattr(status, "is_user_model", False):
+            QMessageBox.warning(
+                self._window,
+                "模型检查",
+                f"当前使用自带模型：{path.name}\n不保证提示词格式、JSON 输出稳定性和 llama.cpp 兼容性。",
+            )
+        elif getattr(status, "downloaded", False):
+            QMessageBox.information(self._window, "模型检查", f"默认模型已下载：{path.name}")
+        else:
+            QMessageBox.information(self._window, "模型检查", f"默认模型已就绪：{path.name}")
+        self._show_home()
+
     def _confirm_reset_progress(self) -> None:
+        confirmation_text = "我确认重置学习进度"
+        text, accepted = QInputDialog.getText(
+            self._window,
+            "确认重置",
+            f"此操作会删除所有学习记录和例句。\n请输入“{confirmation_text}”以继续：",
+        )
+        if not accepted:
+            return
+        if text.strip() != confirmation_text:
+            QMessageBox.information(self._window, "未重置", "确认文本不匹配，学习进度未重置。")
+            return
         imported_count = self._service.replace_words(self._reset_entries_loader())
         self._study_session.clear_last_session()
         QMessageBox.information(
@@ -515,35 +663,45 @@ class WordPycketApp:
 
         layout.addStretch()
         card = self._panel()
-        card.setFixedSize(660, 560)
+        self._study_card = card
+        card.mousePressEvent = lambda event: self._toggle_translation_reveal()
+        card.setFixedSize(860, 560)
         card_layout = QVBoxLayout(card)
         card_layout.setContentsMargins(30, 22, 30, 28)
-        card_layout.setSpacing(12)
+        card_layout.setSpacing(8)
 
         self._word_label = QLabel("")
         self._word_label.setObjectName("word")
         self._word_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._word_label.setFixedHeight(74)
         self._meaning_label = QLabel("")
         self._meaning_label.setObjectName("meaning")
         self._meaning_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._meaning_label.setFixedHeight(34)
         self._forms_label = self._meta_label()
         self._forms_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._forms_label.setFixedHeight(24)
         self._example_label = self._meta_label()
-        self._example_label.setWordWrap(True)
+        self._example_label.setWordWrap(False)
         self._example_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._example_label.setFixedHeight(40)
         self._example_cn_label = self._meta_label()
-        self._example_cn_label.setWordWrap(True)
+        self._example_cn_label.setWordWrap(False)
         self._example_cn_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._example_cn_label.setFixedHeight(34)
         self._review_meta_label = self._meta_label()
-        self._review_meta_label.setWordWrap(True)
+        self._review_meta_label.setWordWrap(False)
         self._review_meta_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._review_meta_label.setFixedHeight(30)
 
         nav_row = QHBoxLayout()
         nav_row.setContentsMargins(0, 0, 0, 0)
         self._previous_button = self._button("‹", self._show_previous_word, "icon")
         self._previous_button.setToolTip("上一个")
+        self._previous_button.setFlat(False)
         self._next_button = self._button("›", self._continue_from_history, "icon")
         self._next_button.setToolTip("下一个")
+        self._next_button.setFlat(False)
         nav_row.addWidget(self._previous_button, 0, Qt.AlignmentFlag.AlignLeft)
         nav_row.addStretch()
         nav_row.addWidget(self._next_button, 0, Qt.AlignmentFlag.AlignRight)
@@ -577,12 +735,13 @@ class WordPycketApp:
         self._render_study_card(self._study_session.begin(mode))  # type: ignore[arg-type]
 
     def _render_study_card(self, state: StudyCardState) -> None:
-        self._word_label.setText(state.word_text)
-        self._meaning_label.setText(state.meaning_text)
-        self._forms_label.setText(state.forms_text)
-        self._example_label.setText(state.example_text)
-        self._example_cn_label.setText(state.example_cn_text)
-        self._review_meta_label.setText(state.meta_text)
+        self._current_card_state = state
+        self._reveal_translation = False
+        self._set_single_line_text(self._word_label, state.word_text, 780)
+        self._set_single_line_text(self._forms_label, state.forms_text, 760)
+        self._set_single_line_text(self._example_label, state.example_text, 780)
+        self._update_translation_labels()
+        self._set_single_line_text(self._review_meta_label, state.meta_text, 780)
         has_entry = state.has_entry
         history_view = state.history_view
         show_actions = has_entry and not history_view
@@ -591,6 +750,35 @@ class WordPycketApp:
         self._definitely_known_button.setVisible(show_actions and self._mode == "learning")
         self._previous_button.setVisible(state.can_show_previous)
         self._next_button.setVisible(history_view)
+
+    def _set_translation_revealed(self, revealed: bool) -> None:
+        if self._reveal_translation == revealed:
+            return
+        self._reveal_translation = revealed
+        self._update_translation_labels()
+
+    def _toggle_translation_reveal(self) -> None:
+        self._set_translation_revealed(not self._reveal_translation)
+
+    def _update_translation_labels(self) -> None:
+        if self._meaning_label is None or self._example_cn_label is None:
+            return
+        state = self._current_card_state
+        if state is None or not state.has_entry:
+            self._set_single_line_text(self._meaning_label, state.meaning_text if state else "", 760)
+            self._set_single_line_text(self._example_cn_label, state.example_cn_text if state else "", 780)
+            return
+        if self._reveal_translation:
+            self._set_single_line_text(self._meaning_label, state.meaning_text, 760)
+            self._set_single_line_text(self._example_cn_label, state.example_cn_text, 780)
+            return
+        self._set_single_line_text(self._meaning_label, "", 760)
+        self._set_single_line_text(self._example_cn_label, "", 780)
+
+    def _set_single_line_text(self, label: QLabel, text: str, max_width: int) -> None:
+        label.setToolTip(text)
+        metrics = label.fontMetrics()
+        label.setText(metrics.elidedText(text, Qt.TextElideMode.ElideRight, max_width))
 
     def _mark_known(self) -> None:
         self._mark_current("known")
@@ -659,6 +847,8 @@ class WordPycketApp:
         self._table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         self._table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
         self._table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self._table.setAlternatingRowColors(True)
+        self._table.setShowGrid(False)
         self._table.verticalHeader().setVisible(False)
         self._table.horizontalHeader().setStretchLastSection(False)
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
@@ -702,12 +892,22 @@ class WordPycketApp:
     def _refresh_words(self, reload_current: bool = True) -> None:
         if self._table is None:
             return
-        self._table.setRowCount(0)
-        query = self._search_input.text() if self._search_input is not None else ""
-        entries = self._visible_word_entries(query)
-        self._table.setRowCount(len(entries))
-        for row, entry in enumerate(entries):
-            self._insert_entry(row, entry)
+        selected_ids = self._selected_entry_ids()
+        self._table.blockSignals(True)
+        try:
+            self._table.setRowCount(0)
+            query = self._search_input.text() if self._search_input is not None else ""
+            entries = self._visible_word_entries(query)
+            self._table.setRowCount(len(entries))
+            for row, entry in enumerate(entries):
+                self._insert_entry(row, entry)
+        finally:
+            self._table.blockSignals(False)
+        if selected_ids:
+            self._restore_table_selection(selected_ids)
+        else:
+            self._selected_ids = []
+            self._selected_id = None
         self._update_count_label()
         if reload_current and self._mode != "words":
             current = self._study_session.current_entry
@@ -728,8 +928,18 @@ class WordPycketApp:
         for column, value in enumerate(values):
             item = QTableWidgetItem(str(value))
             item.setData(Qt.ItemDataRole.UserRole, entry.id)
+            item.setToolTip(str(value))
             if column in {0, 6}:
                 item.setTextAlignment(Qt.AlignmentFlag.AlignRight | Qt.AlignmentFlag.AlignVCenter)
+            else:
+                item.setTextAlignment(Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter)
+            if column == 7:
+                if entry.status == "学习池":
+                    item.setForeground(QColor("#0a84ff"))
+                elif entry.status == "复习池":
+                    item.setForeground(QColor("#b15f00"))
+                else:
+                    item.setForeground(QColor("#596579"))
             self._table.setItem(row, column, item)
 
     def _on_table_selection_changed(self) -> None:
@@ -767,16 +977,26 @@ class WordPycketApp:
         if self._table is None:
             return
         self._table.clearSelection()
+        selection_model = self._table.selectionModel()
+        if selection_model is None:
+            return
         first_row = None
         targets = set(entry_ids)
         for row in range(self._table.rowCount()):
             item = self._table.item(row, 0)
             if item is not None and str(item.data(Qt.ItemDataRole.UserRole)) in targets:
-                self._table.selectRow(row)
+                self._table.setCurrentCell(row, 0)
+                selection_model.select(
+                    self._table.model().index(row, 0),
+                    QItemSelectionModel.SelectionFlag.Select
+                    | QItemSelectionModel.SelectionFlag.Rows,
+                )
                 if first_row is None:
                     first_row = row
         if first_row is not None:
             self._table.scrollToItem(self._table.item(first_row, 0))
+        self._selected_ids = self._selected_entry_ids()
+        self._selected_id = self._selected_ids[0] if self._selected_ids else None
 
     def _delete_selected(self) -> None:
         selected_ids = self._selected_entry_ids()
@@ -898,6 +1118,14 @@ class WordPycketApp:
         if not entries:
             QMessageBox.information(self._window, f"智能{action}失败", "当前词条不存在。")
             return
+        if not self._can_run_isolated_batch():
+            QMessageBox.information(
+                self._window,
+                f"无法智能{action}",
+                "当前生成器不支持隔离子进程，请使用 LocalLlmExampleGenerator。",
+            )
+            return
+        self._warn_if_using_user_model()
 
         scope = self._scope_input.text().strip() if self._scope_input is not None else ""
         self._set_batch_running()
@@ -909,34 +1137,218 @@ class WordPycketApp:
             self._correct_button.setEnabled(False)
         self._set_batch_progress(action, 0, len(entries), 0, 0.0)
 
-        self._batch_thread = QThread()
-        self._batch_worker = BatchWorker(
-            action,
-            entries,
-            scope,
-            self._example_generator,
-            self._service,
-            self._batch_control_state,
+        self._batch_action = action
+        self._batch_scope = scope
+        self._batch_entries = entries
+        self._batch_index = 0
+        self._batch_completed_count = 0
+        self._batch_finished = False
+        self._batch_started_at = time.monotonic()
+        self._batch_updated_ids = []
+        self._batch_errors = []
+        self._batch_processes = {}
+        self._batch_handled_processes = set()
+        self._pump_batch_processes()
+
+    def _can_run_isolated_batch(self) -> bool:
+        return (
+            self._example_generator is not None
+            and hasattr(self._example_generator, "isolated_command")
+            and hasattr(self._example_generator, "isolated_environment")
+            and hasattr(self._example_generator, "isolated_payload")
+            and hasattr(self._example_generator, "parse_isolated_result")
         )
-        self._batch_worker.moveToThread(self._batch_thread)
-        self._batch_thread.started.connect(self._batch_worker.run)
-        self._batch_worker.progress_changed.connect(self._on_batch_progress)
-        self._batch_worker.finished.connect(self._on_batch_finished)
-        self._batch_worker.failed.connect(self._on_batch_failed)
-        self._batch_worker.finished.connect(self._batch_thread.quit)
-        self._batch_worker.failed.connect(self._batch_thread.quit)
-        self._batch_thread.finished.connect(self._batch_worker.deleteLater)
-        self._batch_thread.finished.connect(self._batch_thread.deleteLater)
-        self._batch_thread.start()
 
-    def _on_batch_progress(self, action: str, done: int, total: int, workers: int, elapsed: float) -> None:
-        if action == "补充":
-            self._supplement_button.setText(f"补充中 {done}/{total} 并行 {workers}")
+    def _warn_if_using_user_model(self) -> None:
+        if self._user_model_warning_shown or self._example_generator is None:
+            return
+        if not hasattr(self._example_generator, "uses_user_model"):
+            return
+        try:
+            uses_user_model = self._example_generator.uses_user_model()
+        except Exception:
+            return
+        if not uses_user_model:
+            return
+        self._user_model_warning_shown = True
+        QMessageBox.warning(
+            self._window,
+            "使用自带模型",
+            "检测到 model 目录中已有用户提供的 GGUF 模型，将优先使用该模型。\n"
+            "不同模型的提示词格式、JSON 输出稳定性和 llama.cpp 兼容性可能不同，"
+            "软件不保证自带模型完全兼容。",
+        )
+
+    def _pump_batch_processes(self) -> None:
+        if self._batch_finished:
+            return
+        if self._batch_state == "stopped":
+            if not self._batch_processes:
+                self._finish_isolated_batch()
+            return
+        if self._batch_state == "paused":
+            return
+        if self._batch_index >= len(self._batch_entries) and not self._batch_processes:
+            self._finish_isolated_batch()
+            return
+        if self._example_generator is None:
+            self._batch_errors.append("生成器已不可用。")
+            self._finish_isolated_batch()
+            return
+
+        while (
+            self._batch_state == "running"
+            and self._batch_index < len(self._batch_entries)
+            and len(self._batch_processes) < self._batch_parallel_limit()
+        ):
+            self._start_one_batch_process(self._batch_entries[self._batch_index])
+            self._batch_index += 1
+
+    def _start_one_batch_process(self, entry: WordEntry) -> None:
+        self._on_batch_progress(
+            self._batch_action,
+            self._batch_completed_count,
+            len(self._batch_entries),
+            len(self._batch_processes),
+            time.monotonic() - self._batch_started_at,
+        )
+
+        try:
+            llm_action = "generate" if self._batch_action == "补充" else "correct"
+            command = self._example_generator.isolated_command()
+            payload = self._example_generator.isolated_payload(llm_action, entry, self._batch_scope)
+            env_values = self._example_generator.isolated_environment()
+        except Exception as error:
+            self._batch_errors.append(f"{entry.word}: {error}")
+            self._batch_completed_count += 1
+            QTimer.singleShot(0, self._pump_batch_processes)
+            return
+
+        process = QProcess(self._window)
+        process.setProgram(command[0])
+        process.setArguments(command[1:])
+        environment = QProcessEnvironment.systemEnvironment()
+        for key, value in env_values.items():
+            environment.insert(key, value)
+        process.setProcessEnvironment(environment)
+        process.started.connect(
+            lambda process=process, payload=payload: self._write_batch_process_payload(process, payload)
+        )
+        process.finished.connect(
+            lambda exit_code, exit_status, process=process: self._on_batch_process_finished(
+                process,
+                exit_code,
+                exit_status,
+            )
+        )
+        process.errorOccurred.connect(
+            lambda error, process=process: self._on_batch_process_error(process, error)
+        )
+        self._batch_processes[process] = entry
+        process.start()
+        self._on_batch_progress(
+            self._batch_action,
+            self._batch_completed_count,
+            len(self._batch_entries),
+            len(self._batch_processes),
+            time.monotonic() - self._batch_started_at,
+        )
+
+    def _write_batch_process_payload(self, process: QProcess, payload: str) -> None:
+        if process not in self._batch_processes:
+            return
+        process.write(payload.encode("utf-8"))
+        process.closeWriteChannel()
+
+    def _on_batch_process_error(self, process: QProcess, error: QProcess.ProcessError) -> None:
+        if process in self._batch_handled_processes:
+            return
+        if error != QProcess.ProcessError.FailedToStart:
+            return
+        entry = self._batch_processes.get(process)
+        if entry is None:
+            return
+        detail = bytes(process.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        self._handle_batch_process_failure(process, entry, detail or "模型子进程启动失败。")
+
+    def _on_batch_process_finished(
+        self,
+        process: QProcess,
+        exit_code: int,
+        _exit_status: QProcess.ExitStatus,
+    ) -> None:
+        if process in self._batch_handled_processes:
+            return
+        if self._example_generator is None:
+            return
+        self._batch_handled_processes.add(process)
+        entry = self._batch_processes.pop(process, None)
+        if entry is None:
+            return
+        stdout = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        stderr = bytes(process.readAllStandardError()).decode("utf-8", errors="replace")
+        process.deleteLater()
+
+        try:
+            data = self._example_generator.parse_isolated_result(stdout, stderr, exit_code)
+            self._apply_batch_result(entry, data)
+            self._refresh_words(False)
+            self._restore_table_selection(self._batch_updated_ids)
+        except Exception as error:
+            self._batch_errors.append(f"{entry.word}: {error}")
+
+        self._batch_completed_count += 1
+        self._on_batch_progress(
+            self._batch_action,
+            self._batch_completed_count,
+            len(self._batch_entries),
+            len(self._batch_processes),
+            time.monotonic() - self._batch_started_at,
+        )
+        QTimer.singleShot(0, self._pump_batch_processes)
+
+    def _handle_batch_process_failure(self, process: QProcess, entry: WordEntry, message: str) -> None:
+        self._batch_handled_processes.add(process)
+        self._batch_processes.pop(process, None)
+        process.deleteLater()
+        self._batch_errors.append(f"{entry.word}: {message}")
+        self._batch_completed_count += 1
+        self._on_batch_progress(
+            self._batch_action,
+            self._batch_completed_count,
+            len(self._batch_entries),
+            len(self._batch_processes),
+            time.monotonic() - self._batch_started_at,
+        )
+        QTimer.singleShot(0, self._pump_batch_processes)
+
+    def _apply_batch_result(self, entry: WordEntry, data: dict) -> None:
+        if self._batch_action == "补充":
+            updated = self._service.update_examples(
+                entry.id,
+                str(data["example_sentence"]),
+                str(data["example_sentence_cn"]),
+            )
         else:
-            self._correct_button.setText(f"修正中 {done}/{total} 并行 {workers}")
-        self._set_batch_progress(action, done, total, workers, elapsed)
+            updated = self._service.update_text(
+                entry.id,
+                str(data["corrected_word"]),
+                entry.meaning,
+                entry.forms,
+            )
+        if updated is not None:
+            self._batch_updated_ids.append(updated.id)
 
-    def _on_batch_finished(self, action: str, updated_ids: list[str], errors: list[str], total: int) -> None:
+    def _finish_isolated_batch(self) -> None:
+        if self._batch_finished:
+            return
+        self._batch_finished = True
+        action = self._batch_action
+        total = len(self._batch_entries)
+        updated_ids = list(self._batch_updated_ids)
+        errors = list(self._batch_errors)
+        self._batch_processes = {}
+        self._batch_handled_processes = set()
         self._set_batch_idle()
         self._finish_batch_progress(action, len(updated_ids), total, len(errors))
         self._selected_ids = updated_ids
@@ -946,12 +1358,82 @@ class WordPycketApp:
         message = f"已{action} {len(updated_ids)} / {total} 条。"
         if errors:
             message = f"{message}\n失败 {len(errors)} 条：\n" + "\n".join(errors[:5])
-        QMessageBox.information(self._window, f"智能{action}完成", message)
+        QTimer.singleShot(0, lambda: self._show_batch_message("information", f"智能{action}完成", message))
+
+    def _batch_parallel_limit(self) -> int:
+        if (
+            self._example_generator is not None
+            and hasattr(self._example_generator, "recommended_process_parallelism")
+        ):
+            try:
+                return max(1, min(8, self._example_generator.recommended_process_parallelism()))
+            except Exception:
+                return 2
+
+        raw_value = os.getenv("WORDPYCKET_LLM_PROCESS_PARALLEL")
+        try:
+            return max(1, min(8, int(raw_value))) if raw_value is not None else 2
+        except ValueError:
+            return 2
+
+    def _on_batch_progress(self, action: str, done: int, total: int, workers: int, elapsed: float) -> None:
+        if action == "补充":
+            self._supplement_button.setText(f"补充中 {done}/{total} 并行 {workers}")
+        else:
+            self._correct_button.setText(f"修正中 {done}/{total} 并行 {workers}")
+        self._set_batch_progress(action, done, total, workers, elapsed)
+
+    def _on_batch_finished(
+        self,
+        action: str,
+        updates: list[tuple[str, str, str, str]],
+        errors: list[str],
+        total: int,
+    ) -> None:
+        updated_ids: list[str] = []
+        for entry_id, first_value, second_value, third_value in updates:
+            try:
+                if action == "补充":
+                    updated = self._service.update_examples(entry_id, first_value, second_value)
+                else:
+                    updated = self._service.update_text(entry_id, first_value, second_value, third_value)
+                if updated is not None:
+                    updated_ids.append(updated.id)
+            except Exception as error:
+                entry = self._service.get_word(entry_id)
+                word = entry.word if entry is not None else entry_id
+                errors.append(f"{word}: {error}")
+
+        self._set_batch_idle()
+        self._finish_batch_progress(action, len(updated_ids), total, len(errors))
+        self._selected_ids = updated_ids
+        self._selected_id = updated_ids[0] if updated_ids else None
+        self._refresh_words(False)
+        self._restore_table_selection(updated_ids)
+        message = f"已{action} {len(updated_ids)} / {total} 条。"
+        if errors:
+            message = f"{message}\n失败 {len(errors)} 条：\n" + "\n".join(errors[:5])
+        self._pending_batch_message = ("information", f"智能{action}完成", message)
 
     def _on_batch_failed(self, action: str, message: str) -> None:
         self._set_batch_idle()
         self._clear_batch_progress(f"{action}失败")
-        QMessageBox.critical(self._window, f"智能{action}失败", message)
+        self._pending_batch_message = ("critical", f"智能{action}失败", message)
+
+    def _on_batch_thread_finished(self) -> None:
+        self._batch_thread = None
+        self._batch_worker = None
+        pending_message = self._pending_batch_message
+        self._pending_batch_message = None
+        if pending_message is not None:
+            level, title, message = pending_message
+            QTimer.singleShot(0, lambda: self._show_batch_message(level, title, message))
+
+    def _show_batch_message(self, level: str, title: str, message: str) -> None:
+        if level == "critical":
+            QMessageBox.critical(self._window, title, message)
+            return
+        QMessageBox.information(self._window, title, message)
 
     def _set_batch_running(self) -> None:
         self._batch_state = "running"
@@ -985,6 +1467,8 @@ class WordPycketApp:
         if self._batch_state == "paused":
             self._batch_state = "running"
             self._pause_button.setText("暂停")
+            if self._batch_entries:
+                QTimer.singleShot(0, self._pump_batch_processes)
 
     def _stop_batch(self) -> None:
         if self._batch_state in {"running", "paused"}:
@@ -994,6 +1478,11 @@ class WordPycketApp:
             self._stop_button.setEnabled(False)
             if self._batch_status_label is not None:
                 self._batch_status_label.setText(f"{self._batch_status_label.text()} | 正在停止")
+            if self._batch_processes:
+                for process in list(self._batch_processes):
+                    process.kill()
+            else:
+                QTimer.singleShot(0, self._finish_isolated_batch)
 
     def _batch_control_state(self) -> str:
         return self._batch_state

@@ -42,7 +42,7 @@ class WordEntry:
     @property
     def status(self) -> str:
         if self.is_learned:
-            return "已学习池"
+            return "已掌握"
         if self.correct_count >= 5:
             return "复习池"
         return "学习池"

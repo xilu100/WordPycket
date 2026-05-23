@@ -39,6 +39,7 @@ class StudySessionController:
         self._history_position = -1
         self._session_seen_ids: set[str] = set()
         self._last_session_seen_ids: set[str] = set()
+        self._last_session_mode: StudyMode | None = None
         self._entry_index = 0
 
     @property
@@ -60,6 +61,7 @@ class StudySessionController:
     def leave_active_session(self) -> None:
         if self._mode in {"learning", "review"}:
             self._last_session_seen_ids = set(self._session_seen_ids)
+            self._last_session_mode = self._mode
 
     def reset(self) -> None:
         self._mode = None
@@ -73,6 +75,7 @@ class StudySessionController:
 
     def clear_last_session(self) -> None:
         self._last_session_seen_ids = set()
+        self._last_session_mode = None
 
     def begin(self, mode: StudyMode) -> StudyCardState:
         self._mode = mode
@@ -96,7 +99,7 @@ class StudySessionController:
 
     def mode_entries(self, query: str = "") -> list[WordEntry]:
         entries = self._service.list_words(query)
-        if self._mode in {"learning", "review"}:
+        if self._mode in {"learning", "review"} and self._mode == self._last_session_mode:
             entries = [
                 entry
                 for entry in entries
@@ -143,7 +146,6 @@ class StudySessionController:
             (index, entry)
             for index, entry in enumerate(self._entries)
             if entry.id not in self._session_seen_ids
-            and entry.id not in self._last_session_seen_ids
         ]
         if not candidates:
             return self._complete_state()

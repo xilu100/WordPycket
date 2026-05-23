@@ -9,6 +9,8 @@ import shutil
 import subprocess
 import sys
 import threading
+import time
+import urllib.request
 from dataclasses import dataclass
 from queue import Queue
 from pathlib import Path
@@ -58,7 +60,20 @@ class GeneratedCorrection:
     note: str = ""
 
 
+@dataclass(frozen=True)
+class ModelStatus:
+    path: Path | None
+    is_user_model: bool
+    downloaded: bool = False
+
+
 class LocalLlmExampleGenerator:
+    DEFAULT_MODEL_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
+    DEFAULT_MODEL_FILENAME = "qwen2.5-3b-instruct-q4_k_m.gguf"
+    DEFAULT_MODEL_URL = (
+        f"https://huggingface.co/{DEFAULT_MODEL_REPO}/resolve/main/"
+        f"{DEFAULT_MODEL_FILENAME}?download=true"
+    )
     _AUTO_DEVICE = "auto"
     _CPU_DEVICE = "cpu"
     _CUDA_DEVICE = "cuda"
@@ -75,11 +90,29 @@ class LocalLlmExampleGenerator:
         content = self._call_model(llm, prompt)
         return self._parse_response(content)
 
+    def generate_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedExample:
+        if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
+            return self.generate(entry, scope)
+        data = self._run_isolated_worker("generate", entry, scope)
+        return GeneratedExample(
+            example_sentence=str(data["example_sentence"]),
+            example_sentence_cn=str(data["example_sentence_cn"]),
+        )
+
     def correct_entry(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
         llm = self._load_model(0)
         prompt = self._build_correction_prompt(entry, scope)
         content = self._call_model(llm, prompt)
         return self._parse_correction_response(content, entry)
+
+    def correct_entry_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
+        if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
+            return self.correct_entry(entry, scope)
+        data = self._run_isolated_worker("correct", entry, scope)
+        return GeneratedCorrection(
+            corrected_word=str(data["corrected_word"]),
+            note=str(data.get("note", "")),
+        )
 
     def generate_many(
         self,
@@ -100,7 +133,150 @@ class LocalLlmExampleGenerator:
         return self._run_parallel(entries, self._correct_with_slot, scope, progress, control)
 
     def is_available(self) -> bool:
-        return self._find_model_path() is not None
+        return self._find_existing_model_path() is not None
+
+    def uses_user_model(self) -> bool:
+        model_path = self._find_existing_model_path()
+        return model_path is not None and model_path.name != self.DEFAULT_MODEL_FILENAME
+
+    def model_status(self) -> ModelStatus:
+        model_path = self._find_existing_model_path()
+        return ModelStatus(
+            path=model_path,
+            is_user_model=model_path is not None and model_path.name != self.DEFAULT_MODEL_FILENAME,
+        )
+
+    def ensure_model_available(self) -> ModelStatus:
+        existing_path = self._find_existing_model_path()
+        if existing_path is not None:
+            return ModelStatus(
+                path=existing_path,
+                is_user_model=existing_path.name != self.DEFAULT_MODEL_FILENAME,
+            )
+        model_path = self._download_default_model()
+        return ModelStatus(path=model_path, is_user_model=False, downloaded=True)
+
+    def _run_isolated_worker(
+        self,
+        action: str,
+        entry: WordEntry,
+        scope: str,
+    ) -> dict[str, Any]:
+        env = self.isolated_environment()
+        payload = self.isolated_payload(action, entry, scope)
+        timeout = self._isolated_timeout_seconds()
+        try:
+            result = subprocess.run(
+                self.isolated_command(),
+                input=payload,
+                capture_output=True,
+                text=True,
+                encoding="utf-8",
+                env=env,
+                timeout=timeout,
+                check=False,
+            )
+        except subprocess.TimeoutExpired as error:
+            raise RuntimeError(f"模型子进程超过 {timeout} 秒未完成。") from error
+
+        return self.parse_isolated_result(result.stdout, result.stderr, result.returncode)
+
+    def isolated_command(self) -> list[str]:
+        return [sys.executable, "-m", "wordpycket.infrastructure.example_generator"]
+
+    def isolated_environment(self) -> dict[str, str]:
+        env = os.environ.copy()
+        env["WORDPYCKET_LLM_CHILD"] = "1"
+        env["PYTHONIOENCODING"] = "utf-8"
+        python_paths = [path for path in sys.path if path]
+        existing_python_path = env.get("PYTHONPATH")
+        if existing_python_path:
+            python_paths.append(existing_python_path)
+        env["PYTHONPATH"] = os.pathsep.join(python_paths)
+        return env
+
+    def isolated_payload(self, action: str, entry: WordEntry, scope: str) -> str:
+        payload = {
+            "action": action,
+            "model_dir": str(self._model_dir),
+            "scope": scope,
+            "entry": {
+                "word": entry.word,
+                "meaning": entry.meaning,
+                "source_index": entry.source_index,
+                "frequency": entry.frequency,
+                "forms": entry.forms,
+                "example_sentence": entry.example_sentence,
+                "example_sentence_cn": entry.example_sentence_cn,
+            },
+        }
+        return json.dumps(payload, ensure_ascii=False)
+
+    def parse_isolated_result(
+        self,
+        stdout: str,
+        stderr: str,
+        returncode: int,
+    ) -> dict[str, Any]:
+        if returncode != 0:
+            recovered = self._parse_isolated_stdout(stdout)
+            if recovered is not None:
+                return recovered
+            detail = (stderr or stdout).strip()
+            if detail:
+                raise RuntimeError(f"模型子进程退出代码 {returncode}：{detail}")
+            raise RuntimeError(f"模型子进程退出代码 {returncode}。")
+
+        data = self._parse_isolated_stdout(stdout)
+        if data is None:
+            raise RuntimeError(f"模型子进程返回内容不是有效 JSON：{stdout}")
+        return data
+
+    def recommended_process_parallelism(self) -> int:
+        override = os.getenv("WORDPYCKET_LLM_PROCESS_PARALLEL")
+        if override is not None:
+            try:
+                return max(1, min(8, int(override)))
+            except ValueError as error:
+                raise RuntimeError("WORDPYCKET_LLM_PROCESS_PARALLEL 必须是整数。") from error
+
+        model_path = self._find_existing_model_path()
+        model_size_mb = self._model_size_mb(model_path)
+        memory_mb = self._system_memory_mb()
+        cpu_count = os.cpu_count() or 1
+
+        if self._detect_accelerator() == self._CUDA_DEVICE:
+            free_vram_mb = self._cuda_free_vram_mb()
+            if free_vram_mb is not None:
+                vram_per_worker_mb = max(2600, int(model_size_mb * 0.65) + 900)
+                ram_per_worker_mb = max(2600, int(model_size_mb * 0.9) + 900)
+                vram_workers = max(1, free_vram_mb // vram_per_worker_mb)
+                ram_workers = max(1, memory_mb // ram_per_worker_mb)
+                return max(1, min(4, vram_workers, ram_workers))
+            return 1
+
+        per_worker_mb = max(3600, int(model_size_mb * 2.0) + 1400)
+        memory_workers = max(1, memory_mb // per_worker_mb)
+        cpu_workers = max(1, cpu_count // self._threads_per_model())
+        return max(1, min(4, memory_workers, cpu_workers))
+
+    @staticmethod
+    def _parse_isolated_stdout(stdout: str) -> dict[str, Any] | None:
+        try:
+            data = json.loads(stdout)
+        except json.JSONDecodeError:
+            return None
+        if not isinstance(data, dict):
+            return None
+        return data
+
+    @staticmethod
+    def _isolated_timeout_seconds() -> int:
+        raw_value = os.getenv("WORDPYCKET_LLM_TIMEOUT", "300")
+        try:
+            return max(1, int(raw_value))
+        except ValueError as error:
+            raise RuntimeError("WORDPYCKET_LLM_TIMEOUT 必须是整数秒。") from error
 
     def _load_model(self, slot: int):
         with self._llm_lock:
@@ -109,7 +285,7 @@ class LocalLlmExampleGenerator:
             if self._llms[slot] is not None:
                 return self._llms[slot]
 
-            model_path = self._find_model_path()
+            model_path = self._ensure_model_path()
             if model_path is None:
                 raise RuntimeError("model 目录中没有找到 .gguf 模型文件。")
 
@@ -257,7 +433,7 @@ class LocalLlmExampleGenerator:
             except ValueError as error:
                 raise RuntimeError("WORDPYCKET_LLM_PARALLEL 必须是整数。") from error
 
-        model_path = self._find_model_path()
+        model_path = self._find_existing_model_path()
         model_size_mb = self._model_size_mb(model_path)
         if self._detect_accelerator() == self._CUDA_DEVICE:
             free_vram_mb = self._cuda_free_vram_mb()
@@ -489,16 +665,77 @@ class LocalLlmExampleGenerator:
             f"{prompt}\n\nJSON:"
         )
 
-    def _find_model_path(self) -> Path | None:
+    def _find_existing_model_path(self) -> Path | None:
         if not self._model_dir.exists():
             return None
 
         models = sorted(
             self._model_dir.glob("*.gguf"),
-            key=lambda path: path.stat().st_size,
-            reverse=True,
+            key=lambda path: (
+                path.name != self.DEFAULT_MODEL_FILENAME,
+                -path.stat().st_size,
+            ),
         )
+        if len(models) > 1:
+            names = "、".join(path.name for path in models)
+            raise RuntimeError(f"model 目录中只能存在一个 .gguf 模型文件。当前存在：{names}")
         return models[0] if models else None
+
+    def _ensure_model_path(self) -> Path | None:
+        model_path = self._find_existing_model_path()
+        if model_path is not None:
+            return model_path
+        return self._download_default_model()
+
+    def _download_default_model(self) -> Path:
+        self._model_dir.mkdir(parents=True, exist_ok=True)
+        target_path = self._model_dir / self.DEFAULT_MODEL_FILENAME
+        lock_path = self._model_dir / f"{self.DEFAULT_MODEL_FILENAME}.lock"
+        partial_path = self._model_dir / f"{self.DEFAULT_MODEL_FILENAME}.part"
+
+        lock_fd = self._acquire_download_lock(lock_path, target_path)
+        if lock_fd is None:
+            return target_path
+
+        try:
+            if target_path.exists():
+                return target_path
+            if partial_path.exists():
+                partial_path.unlink()
+            print(
+                f"正在从 Hugging Face 下载默认模型 {self.DEFAULT_MODEL_REPO}/"
+                f"{self.DEFAULT_MODEL_FILENAME} ...",
+                file=sys.stderr,
+                flush=True,
+            )
+            with urllib.request.urlopen(self.DEFAULT_MODEL_URL, timeout=60) as response:
+                with partial_path.open("wb") as file:
+                    shutil.copyfileobj(response, file, length=1024 * 1024)
+            partial_path.replace(target_path)
+            return target_path
+        except Exception:
+            if partial_path.exists():
+                partial_path.unlink()
+            raise
+        finally:
+            os.close(lock_fd)
+            try:
+                lock_path.unlink()
+            except FileNotFoundError:
+                pass
+
+    @staticmethod
+    def _acquire_download_lock(lock_path: Path, target_path: Path) -> int | None:
+        deadline = time.monotonic() + 3600
+        while True:
+            if target_path.exists():
+                return None
+            try:
+                return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("等待默认模型下载超时。")
+                time.sleep(1)
 
     @staticmethod
     def _build_prompt(entry: WordEntry, scope: str = "") -> str:
@@ -614,3 +851,39 @@ class LocalLlmExampleGenerator:
             corrected_word=corrected_word,
             note=note,
         )
+
+
+def _main() -> None:
+    payload = json.loads(sys.stdin.read())
+    entry_data = payload["entry"]
+    entry = WordEntry(
+        word=entry_data["word"],
+        meaning=entry_data["meaning"],
+        source_index=int(entry_data.get("source_index", 0)),
+        frequency=int(entry_data.get("frequency", 0)),
+        forms=str(entry_data.get("forms", "")),
+        example_sentence=str(entry_data.get("example_sentence", "")),
+        example_sentence_cn=str(entry_data.get("example_sentence_cn", "")),
+    )
+    generator = LocalLlmExampleGenerator(Path(payload["model_dir"]))
+    action = payload["action"]
+    scope = str(payload.get("scope", ""))
+    if action == "generate":
+        generated = generator.generate(entry, scope)
+        result = {
+            "example_sentence": generated.example_sentence,
+            "example_sentence_cn": generated.example_sentence_cn,
+        }
+    elif action == "correct":
+        corrected = generator.correct_entry(entry, scope)
+        result = {
+            "corrected_word": corrected.corrected_word,
+            "note": corrected.note,
+        }
+    else:
+        raise RuntimeError(f"未知智能任务：{action}")
+    print(json.dumps(result, ensure_ascii=False), flush=True)
+
+
+if __name__ == "__main__":
+    _main()

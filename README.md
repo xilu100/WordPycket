@@ -47,6 +47,35 @@
 
 ## 运行
 
+安装依赖：
+
+```powershell
+pip install -r requirements-windows.txt
+```
+
+macOS：
+
+```bash
+pip install -r requirements-macos.txt
+```
+
+Windows NVIDIA CUDA 可选加速：
+
+```powershell
+pip install -r requirements-windows.txt
+$env:CMAKE_ARGS="-DGGML_CUDA=on"
+$env:FORCE_CMAKE="1"
+pip install --upgrade --force-reinstall --no-cache-dir llama-cpp-python
+```
+
+macOS Apple Metal 可选加速：
+
+```bash
+pip install -r requirements-macos.txt
+CMAKE_ARGS="-DGGML_METAL=on" FORCE_CMAKE=1 \
+  pip install --upgrade --force-reinstall --no-cache-dir llama-cpp-python
+```
+
 ```powershell
 python -m wordpycket.main
 ```
@@ -57,11 +86,20 @@ python -m wordpycket.main
 $env:PYTHONPATH="src"; python -m wordpycket.main
 ```
 
+## 本地模型
+
+- 智能补充/修正使用 `model/` 目录中的 `.gguf` 模型。
+- `model/` 目录中只能存在一个 `.gguf` 文件；如果存在多个，智能功能会停止并提示清理。
+- 如果 `model/` 中没有 `.gguf` 文件，首次使用智能功能时会自动从 Hugging Face 下载默认模型：
+  `Qwen/Qwen2.5-3B-Instruct-GGUF/qwen2.5-3b-instruct-q4_k_m.gguf`。
+- 如果用户自行放入 `.gguf` 模型，软件会优先使用用户模型，并在智能功能启动前提示兼容性不保证。
+- 默认模型来源：Hugging Face `Qwen/Qwen2.5-3B-Instruct-GGUF`。
+
 ## 架构
 
 - `domain`：领域实体和仓储接口，不依赖外层实现。
 - `application`：应用服务，编排用例。
 - `infrastructure`：SQLite 仓储实现和 CSV 导入器。
-- `presentation`：Qt GUI。旧 Tkinter 实现仍保留在 `tk_app.py`，当前入口使用 `qt_app.py`。
+- `presentation`：GUI 展示层。当前入口使用 Qt 实现 `qt_app.py`；Tkinter 版本仍保留在 `tk_app.py` 作为稳定回退。
 
 依赖方向为：`presentation -> application -> domain`，`infrastructure -> domain`。
