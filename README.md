@@ -36,7 +36,7 @@ run.command
 chmod +x run.command
 ```
 
-`run.command` 不会寻找或使用电脑上已有的 Python。它会先在项目目录内下载 `uv`，再把完整 Python 安装到 `runtime/python/`，然后创建 `.venv/`、`model/` 和 `data/`，并自动配置环境后启动。Apple Silicon 机器会优先配置 Metal 版 `llama-cpp-python`；其它机器使用 CPU。
+`run.command` 不会寻找或使用电脑上已有的 Python。它会先在项目目录内下载 `uv`，再把完整 Python 3.11 安装到 `runtime/python/`，然后创建 `.venv/`、`model/` 和 `data/`，并自动配置环境后启动。Apple Silicon 机器会优先配置 Metal 版 `llama-cpp-python`；其它机器使用 CPU。
 
 ### 本地文件
 
