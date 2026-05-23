@@ -20,6 +20,7 @@ $env:UV_CACHE_DIR = Join-Path $Root "runtime\cache\uv"
 $env:UV_PYTHON_INSTALL_DIR = $PythonInstallDir
 $env:UV_PYTHON_PREFERENCE = "only-managed"
 $env:UV_PROJECT_ENVIRONMENT = $VenvPath
+$env:PYTHONPATH = if ($env:PYTHONPATH) { "$(Join-Path $Root "src");$env:PYTHONPATH" } else { Join-Path $Root "src" }
 
 New-Item -ItemType Directory -Force -Path $env:PIP_CACHE_DIR | Out-Null
 New-Item -ItemType Directory -Force -Path $env:HF_HOME | Out-Null
@@ -42,7 +43,21 @@ function Install-LocalUv {
 
 function Install-LocalPython {
     Write-Host "Installing managed Python $PythonVersion into $PythonInstallDir"
-    & $UvExe python install $PythonVersion
+    Invoke-NativeChecked $UvExe "python" "install" $PythonVersion
+}
+
+function Invoke-NativeChecked {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string] $FilePath,
+        [Parameter(ValueFromRemainingArguments = $true)]
+        [string[]] $Arguments
+    )
+
+    & $FilePath @Arguments
+    if ($LASTEXITCODE -ne 0) {
+        throw "Command failed with exit code ${LASTEXITCODE}: $FilePath $($Arguments -join ' ')"
+    }
 }
 
 function Get-VenvPythonVersion {
@@ -65,13 +80,13 @@ if (($null -ne $ExistingPythonVersion) -and ($ExistingPythonVersion -ne $PythonV
 }
 
 if (-not (Test-Path $VenvPython)) {
-    & $UvExe venv --seed --python $PythonVersion $VenvPath
+    Invoke-NativeChecked $UvExe "venv" "--seed" "--python" $PythonVersion $VenvPath
     $NeedsSetup = $true
 }
 
 if ($NeedsSetup) {
-    & $VenvPython (Join-Path $Root "scripts\setup_env.py") --strict-accel
+    Invoke-NativeChecked $VenvPython (Join-Path $Root "scripts\setup_env.py") "--strict-accel"
     New-Item -ItemType File -Force -Path $SetupMarker | Out-Null
 }
 
-& $VenvPython -m wordpycket.main
+Invoke-NativeChecked $VenvPython "-m" "wordpycket.main"
