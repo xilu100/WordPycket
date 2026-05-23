@@ -1,6 +1,9 @@
 import os
+import re
 import sys
+import threading
 import time
+import traceback
 from collections.abc import Callable
 from pathlib import Path
 from typing import Protocol
@@ -64,6 +67,10 @@ class ExampleGenerator(Protocol):
 
     def correct_entry_isolated(self, entry: WordEntry, scope: str = ""): ...
 
+    def explain_entry(self, entry: WordEntry, scope: str = "", language: str = ""): ...
+
+    def explain_entry_isolated(self, entry: WordEntry, scope: str = "", language: str = ""): ...
+
     def generate_many(self, entries: list[WordEntry], scope: str = "", progress=None, control=None): ...
 
     def correct_many(self, entries: list[WordEntry], scope: str = "", progress=None, control=None): ...
@@ -84,7 +91,7 @@ class ExampleGenerator(Protocol):
 
     def isolated_environment(self) -> dict[str, str]: ...
 
-    def isolated_payload(self, action: str, entry: WordEntry, scope: str) -> str: ...
+    def isolated_payload(self, action: str, entry: WordEntry, scope: str, language: str = "") -> str: ...
 
     def parse_isolated_result(self, stdout: str, stderr: str, returncode: int) -> dict: ...
 
@@ -208,6 +215,35 @@ class BatchWorker(QObject):
         return self._control() != "stopped"
 
 
+class PdfImportWorker(QObject):
+    progress_changed = Signal(str, int)
+    finished = Signal(object)
+    failed = Signal(str)
+
+    def __init__(
+        self,
+        pdf_path: Path,
+        use_llm_cleanup: bool,
+        pdf_import_loader: Callable[[Path, bool, Callable[[str, int], None] | None], PdfImportResult],
+    ) -> None:
+        super().__init__()
+        self._pdf_path = pdf_path
+        self._use_llm_cleanup = use_llm_cleanup
+        self._pdf_import_loader = pdf_import_loader
+
+    def run(self) -> None:
+        try:
+            result = self._pdf_import_loader(
+                self._pdf_path,
+                self._use_llm_cleanup,
+                lambda message, percent: self.progress_changed.emit(message, percent),
+            )
+        except Exception as error:
+            self.failed.emit(str(error))
+            return
+        self.finished.emit(result)
+
+
 class WordPycketApp:
     def __init__(
         self,
@@ -215,12 +251,15 @@ class WordPycketApp:
         example_generator: ExampleGenerator | None = None,
         csv_import_loader: Callable[[Path], CsvImportResult] | None = None,
         csv_storage_path: Path | None = None,
-        pdf_import_loader: Callable[[Path], PdfImportResult] | None = None,
+        pdf_import_loader: Callable[[Path, bool, Callable[[str, int], None] | None], PdfImportResult] | None = None,
         csv_files_loader: Callable[[], list[Path]] | None = None,
         active_csv_loader: Callable[[], Path | None] | None = None,
         csv_switcher: Callable[[Path], CsvDatasetResult] | None = None,
         csv_upload_handler: Callable[[Path], CsvDatasetResult] | None = None,
         csv_delete_handler: Callable[[Path], CsvDatasetResult | None] | None = None,
+        ai_scope_loader: Callable[[], str] | None = None,
+        ai_scope_saver: Callable[[str], None] | None = None,
+        current_language_loader: Callable[[], str] | None = None,
     ) -> None:
         self._service = service
         self._example_generator = example_generator
@@ -232,15 +271,22 @@ class WordPycketApp:
         self._csv_switcher = csv_switcher
         self._csv_upload_handler = csv_upload_handler
         self._csv_delete_handler = csv_delete_handler
+        self._ai_scope_saver = ai_scope_saver
         self._study_session = StudySessionController(service)
         self._selected_id: str | None = None
         self._selected_ids: list[str] = []
         self._mode: str | None = None
+        self._ai_scope = self._load_initial_ai_scope(ai_scope_loader)
+        self._current_language = self._load_initial_language(current_language_loader)
         self._batch_state = "idle"
         self._batch_thread: QThread | None = None
         self._batch_worker: BatchWorker | None = None
+        self._pdf_import_thread: QThread | None = None
+        self._pdf_import_worker: PdfImportWorker | None = None
         self._batch_processes: dict[QProcess, WordEntry] = {}
         self._batch_handled_processes: set[QProcess] = set()
+        self._explain_process: QProcess | None = None
+        self._explain_entry: WordEntry | None = None
         self._batch_action = ""
         self._batch_scope = ""
         self._batch_entries: list[WordEntry] = []
@@ -252,8 +298,11 @@ class WordPycketApp:
         self._batch_errors: list[str] = []
         self._pending_batch_message: tuple[str, str, str] | None = None
         self._user_model_warning_shown = False
+        self._pdf_import_started_at = 0.0
+        self._pdf_ai_started_at = 0.0
 
         self._app = QApplication.instance() or QApplication(sys.argv)
+        self._install_exception_boundary()
         self._window = QMainWindow()
         self._window.setWindowTitle("WordPycket")
         self._window.resize(1220, 720)
@@ -275,6 +324,9 @@ class WordPycketApp:
         self._unknown_button: QPushButton | None = None
         self._known_button: QPushButton | None = None
         self._definitely_known_button: QPushButton | None = None
+        self._explain_current_study_button: QPushButton | None = None
+        self._edit_current_study_button: QPushButton | None = None
+        self._delete_current_study_button: QPushButton | None = None
         self._previous_button: QPushButton | None = None
         self._next_button: QPushButton | None = None
         self._word_label: QLabel | None = None
@@ -291,7 +343,33 @@ class WordPycketApp:
 
     def run(self) -> None:
         self._window.show()
+        self._bring_window_to_front()
         self._app.exec()
+
+    @staticmethod
+    def _load_initial_ai_scope(loader: Callable[[], str] | None) -> str:
+        default = "人工智能相关的翻译"
+        if loader is None:
+            return default
+        try:
+            value = loader().strip()
+        except Exception:
+            return default
+        return value or default
+
+    @staticmethod
+    def _load_initial_language(loader: Callable[[], str] | None) -> str:
+        if loader is None:
+            return ""
+        try:
+            return loader().strip()
+        except Exception:
+            return ""
+
+    def _bring_window_to_front(self) -> None:
+        self._window.showNormal()
+        self._window.raise_()
+        self._window.activateWindow()
 
     def _apply_style(self) -> None:
         fonts = _font_config()
@@ -313,9 +391,9 @@ class WordPycketApp:
                 );
             }}
             QFrame#glassPanel {{
-                background: rgba(255, 255, 255, 172);
-                border: 1px solid rgba(255, 255, 255, 210);
-                border-radius: 30px;
+                background: rgba(255, 255, 255, 214);
+                border: 1px solid rgba(216, 228, 242, 230);
+                border-radius: 16px;
             }}
             QLabel {{
                 background: transparent;
@@ -345,48 +423,50 @@ class WordPycketApp:
                 font-weight: 700;
             }}
             QPushButton {{
-                background: rgba(255, 255, 255, 154);
-                border: 1px solid rgba(255, 255, 255, 196);
-                border-radius: 20px;
-                padding: 9px 18px;
+                background: rgba(255, 255, 255, 230);
+                border: 1px solid rgba(205, 219, 237, 230);
+                border-radius: 12px;
+                padding: 8px 16px;
                 font-weight: 700;
-                min-height: 20px;
+                min-height: 24px;
             }}
             QPushButton:hover {{
-                background: rgba(255, 255, 255, 210);
+                background: rgba(244, 249, 255, 245);
+                border-color: rgba(170, 197, 228, 240);
             }}
             QPushButton:pressed {{
-                padding-top: 10px;
-                padding-bottom: 8px;
-                background: rgba(232, 242, 255, 220);
+                background: rgba(226, 240, 255, 240);
             }}
             QPushButton:disabled {{
                 color: #9aa6b5;
-                background: rgba(237, 241, 247, 120);
+                background: rgba(238, 243, 249, 150);
+                border-color: rgba(218, 228, 240, 180);
             }}
             QPushButton[variant="primary"] {{
                 color: white;
-                background: rgba(10, 132, 255, 218);
-                border-color: rgba(145, 202, 255, 210);
+                background: rgba(10, 116, 220, 235);
+                border-color: rgba(10, 116, 220, 235);
             }}
             QPushButton[variant="primary"]:hover {{
-                background: rgba(0, 110, 219, 230);
+                background: rgba(0, 99, 195, 240);
+                border-color: rgba(0, 99, 195, 240);
             }}
             QPushButton[variant="danger"] {{
-                color: #ff3b30;
-                background: rgba(255, 240, 239, 172);
-                border-color: rgba(255, 210, 206, 210);
+                color: #c3261f;
+                background: rgba(255, 245, 244, 230);
+                border-color: rgba(246, 196, 191, 230);
             }}
             QPushButton[variant="danger"]:hover {{
-                color: #d92d24;
-                background: rgba(255, 226, 223, 220);
+                color: #9f1f19;
+                background: rgba(255, 235, 233, 240);
+                border-color: rgba(232, 164, 158, 240);
             }}
             QPushButton[variant="icon"] {{
-                border-radius: 18px;
-                min-width: 36px;
-                max-width: 36px;
-                min-height: 36px;
-                max-height: 36px;
+                border-radius: 12px;
+                min-width: 40px;
+                max-width: 40px;
+                min-height: 40px;
+                max-height: 40px;
                 padding: 0 0 3px 0;
                 font-family: {fonts["icon_stack"]};
                 font-size: 24px;
@@ -396,9 +476,9 @@ class WordPycketApp:
                 padding: 0 0 3px 0;
             }}
             QLineEdit, QPlainTextEdit {{
-                background: rgba(255, 255, 255, 178);
-                border: 1px solid rgba(255, 255, 255, 210);
-                border-radius: 16px;
+                background: rgba(255, 255, 255, 235);
+                border: 1px solid rgba(205, 219, 237, 230);
+                border-radius: 12px;
                 padding: 8px 10px;
                 color: #172033;
                 selection-background-color: #d8ebff;
@@ -460,10 +540,10 @@ class WordPycketApp:
                 background: #d8ebff;
             }}
             QTableWidget {{
-                background: rgba(255, 255, 255, 172);
-                border: 1px solid rgba(255, 255, 255, 210);
-                border-radius: 22px;
-                gridline-color: rgba(225, 233, 244, 120);
+                background: rgba(255, 255, 255, 226);
+                border: 1px solid rgba(216, 228, 242, 230);
+                border-radius: 14px;
+                gridline-color: transparent;
                 alternate-background-color: rgba(247, 250, 255, 118);
                 selection-background-color: rgba(212, 226, 244, 178);
                 selection-color: #172033;
@@ -478,8 +558,7 @@ class WordPycketApp:
             QTableWidget::item:selected {{
                 background: rgba(212, 226, 244, 178);
                 color: #172033;
-                border-top: 1px solid rgba(169, 194, 224, 100);
-                border-bottom: 1px solid rgba(169, 194, 224, 100);
+                border: none;
             }}
             QTableWidget::item:selected:active,
             QTableWidget::item:selected:!active {{
@@ -493,7 +572,7 @@ class WordPycketApp:
                 background: rgba(238, 244, 252, 185);
                 color: #596579;
                 border: none;
-                border-bottom: 1px solid rgba(216, 228, 242, 170);
+                border-bottom: 1px solid rgba(216, 228, 242, 150);
                 padding: 8px;
                 font-weight: 700;
             }}
@@ -563,18 +642,52 @@ class WordPycketApp:
         panel = QFrame()
         panel.setObjectName("glassPanel")
         effect = QGraphicsDropShadowEffect(panel)
-        effect.setBlurRadius(42)
-        effect.setOffset(0, 14)
-        effect.setColor(QColor(78, 106, 145, 62))
+        effect.setBlurRadius(28)
+        effect.setOffset(0, 10)
+        effect.setColor(QColor(78, 106, 145, 42))
         panel.setGraphicsEffect(effect)
         return panel
 
     def _button(self, text: str, callback: Callable[[], None], variant: str = "") -> QPushButton:
         button = QPushButton(text)
+        button.setMinimumWidth(40 if variant == "icon" else 76)
         if variant:
             button.setProperty("variant", variant)
-        button.clicked.connect(callback)
+        button.clicked.connect(self._safe_slot(callback))
         return button
+
+    def _safe_slot(self, callback: Callable) -> Callable:
+        def wrapped(*args, **kwargs):
+            try:
+                return callback(*args, **kwargs)
+            except TypeError:
+                try:
+                    return callback()
+                except Exception as error:
+                    self._handle_ui_exception(error)
+            except Exception as error:
+                self._handle_ui_exception(error)
+            return None
+
+        return wrapped
+
+    def _install_exception_boundary(self) -> None:
+        def excepthook(exc_type, exc_value, exc_traceback) -> None:
+            self._handle_ui_exception(exc_value, exc_traceback)
+
+        def thread_excepthook(args) -> None:
+            self._handle_ui_exception(args.exc_value, args.exc_traceback)
+
+        sys.excepthook = excepthook
+        if hasattr(threading, "excepthook"):
+            threading.excepthook = thread_excepthook
+
+    def _handle_ui_exception(self, error: BaseException, exc_traceback=None) -> None:
+        traceback.print_exception(type(error), error, exc_traceback or error.__traceback__)
+        try:
+            QMessageBox.critical(self._window, "操作失败", str(error) or error.__class__.__name__)
+        except Exception:
+            pass
 
     def _meta_label(self, text: str = "") -> QLabel:
         label = QLabel(text)
@@ -720,6 +833,7 @@ class WordPycketApp:
         self._study_session.reset()
         self._selected_id = None
         self._selected_ids = []
+        self._current_language = result.language
         QMessageBox.information(
             dialog,
             "CSV 已切换",
@@ -755,8 +869,10 @@ class WordPycketApp:
         self._selected_id = None
         self._selected_ids = []
         if result is None:
+            self._current_language = ""
             QMessageBox.information(dialog, "CSV 已删除", "当前 CSV 已删除。input 中没有其它 CSV。")
         else:
+            self._current_language = result.language
             QMessageBox.information(
                 dialog,
                 "CSV 已删除",
@@ -847,6 +963,8 @@ class WordPycketApp:
         if not hasattr(self._example_generator, "check_model_runtime"):
             QMessageBox.information(self._window, "模型检查", "当前生成器不支持模型检查。")
             return
+        if not self._confirm_model_download("检查模型"):
+            return
         try:
             result = self._example_generator.check_model_runtime()
         except Exception as error:
@@ -914,10 +1032,20 @@ class WordPycketApp:
         layout.setSpacing(18)
 
         title_bar = QHBoxLayout()
+        title_bar.setSpacing(10)
         title = QLabel("学习" if mode == "learning" else "复习")
         title.setObjectName("homeTitle")
         title_bar.addWidget(title)
         title_bar.addStretch()
+        self._explain_current_study_button = self._button("AI解释", self._explain_current_study_word, "primary")
+        self._explain_current_study_button.setToolTip("用本地 AI 解释当前词条")
+        self._edit_current_study_button = self._button("编辑当前词", self._edit_current_study_word)
+        self._edit_current_study_button.setToolTip("编辑当前词条并保存到数据库")
+        self._delete_current_study_button = self._button("删除当前词", self._confirm_delete_current_study_word, "danger")
+        self._delete_current_study_button.setToolTip("从当前词库中删除这个词条")
+        title_bar.addWidget(self._explain_current_study_button)
+        title_bar.addWidget(self._edit_current_study_button)
+        title_bar.addWidget(self._delete_current_study_button)
         title_bar.addWidget(self._button("返回主页", self._show_home))
         layout.addLayout(title_bar)
 
@@ -927,8 +1055,8 @@ class WordPycketApp:
         card.mousePressEvent = lambda event: self._toggle_translation_reveal()
         card.setFixedSize(860, 560)
         card_layout = QVBoxLayout(card)
-        card_layout.setContentsMargins(30, 22, 30, 28)
-        card_layout.setSpacing(8)
+        card_layout.setContentsMargins(34, 26, 34, 30)
+        card_layout.setSpacing(10)
 
         self._word_label = QLabel("")
         self._word_label.setObjectName("word")
@@ -956,6 +1084,7 @@ class WordPycketApp:
 
         nav_row = QHBoxLayout()
         nav_row.setContentsMargins(0, 0, 0, 0)
+        nav_row.setSpacing(12)
         self._previous_button = self._button("‹", self._show_previous_word, "icon")
         self._previous_button.setToolTip("上一个")
         self._previous_button.setFlat(False)
@@ -974,8 +1103,9 @@ class WordPycketApp:
         card_layout.addStretch()
 
         actions = QGridLayout()
-        actions.setHorizontalSpacing(8)
-        actions.setVerticalSpacing(8)
+        actions.setHorizontalSpacing(12)
+        actions.setVerticalSpacing(10)
+        actions.setContentsMargins(90, 0, 90, 0)
         self._unknown_button = self._button("不会", self._mark_unknown, "danger")
         self._known_button = self._button("会", self._mark_known, "primary")
         self._definitely_known_button = self._button("绝对会", self._mark_definitely_known, "primary")
@@ -1008,8 +1138,11 @@ class WordPycketApp:
         self._unknown_button.setVisible(show_actions)
         self._known_button.setVisible(show_actions)
         self._definitely_known_button.setVisible(show_actions and self._mode == "learning")
+        self._explain_current_study_button.setVisible(has_entry)
+        self._edit_current_study_button.setVisible(has_entry)
+        self._delete_current_study_button.setVisible(has_entry)
         self._previous_button.setVisible(state.can_show_previous)
-        self._next_button.setVisible(history_view)
+        self._next_button.setVisible(state.can_show_next)
 
     def _set_translation_revealed(self, revealed: bool) -> None:
         if self._reveal_translation == revealed:
@@ -1056,12 +1189,182 @@ class WordPycketApp:
             return
         self._render_study_card(state)
 
+    def _confirm_delete_current_study_word(self) -> None:
+        state = self._current_card_state
+        entry = state.entry if state is not None else None
+        if entry is None:
+            return
+        answer = QMessageBox.question(
+            self._window,
+            "确认删除词条",
+            f"确定要从当前词库中删除“{entry.word}”吗？\n此操作会删除该词条的学习记录和例句。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return
+        next_state = self._study_session.delete_current()
+        if next_state is not None:
+            self._render_study_card(next_state)
+
+    def _edit_current_study_word(self) -> None:
+        state = self._current_card_state
+        entry = state.entry if state is not None else None
+        if entry is None:
+            return
+        self._show_word_editor(entry, refresh_after_save=lambda updated: self._refresh_current_study_entry(updated.id))
+
+    def _explain_current_study_word(self) -> None:
+        state = self._current_card_state
+        entry = state.entry if state is not None else None
+        if entry is None:
+            return
+        if self._explain_process is not None:
+            QMessageBox.information(self._window, "AI解释", "当前解释还在生成中。")
+            return
+        if self._example_generator is None:
+            QMessageBox.information(self._window, "无法AI解释", "未配置本地模型生成器。")
+            return
+        if not self._confirm_model_download("AI解释"):
+            return
+        if not self._can_run_isolated_batch():
+            QMessageBox.information(
+                self._window,
+                "无法AI解释",
+                "当前生成器不支持隔离子进程，请使用 LocalLlmExampleGenerator。",
+            )
+            return
+        self._warn_if_using_user_model()
+
+        try:
+            command = self._example_generator.isolated_command()
+            payload = self._example_generator.isolated_payload(
+                "explain",
+                entry,
+                self._ai_scope,
+                self._current_language,
+            )
+            env_values = self._example_generator.isolated_environment()
+        except Exception as error:
+            QMessageBox.critical(self._window, "AI解释失败", str(error))
+            return
+
+        process = QProcess(self._window)
+        process.setProgram(command[0])
+        process.setArguments(command[1:])
+        environment = QProcessEnvironment.systemEnvironment()
+        for key, value in env_values.items():
+            environment.insert(key, value)
+        process.setProcessEnvironment(environment)
+        process.started.connect(
+            self._safe_slot(lambda process=process, payload=payload: self._write_explain_process_payload(process, payload))
+        )
+        process.finished.connect(
+            self._safe_slot(lambda exit_code, exit_status, process=process: self._on_explain_process_finished(
+                process,
+                exit_code,
+                exit_status,
+            ))
+        )
+        process.errorOccurred.connect(
+            self._safe_slot(lambda error, process=process: self._on_explain_process_error(process, error))
+        )
+        self._explain_process = process
+        self._explain_entry = entry
+        if self._explain_current_study_button is not None:
+            self._explain_current_study_button.setText("解释中")
+            self._explain_current_study_button.setEnabled(False)
+        process.start()
+
+    def _write_explain_process_payload(self, process: QProcess, payload: str) -> None:
+        if process is not self._explain_process:
+            return
+        process.write(payload.encode("utf-8"))
+        process.closeWriteChannel()
+
+    def _on_explain_process_error(self, process: QProcess, error: QProcess.ProcessError) -> None:
+        if process is not self._explain_process:
+            return
+        if error != QProcess.ProcessError.FailedToStart:
+            return
+        detail = bytes(process.readAllStandardError()).decode("utf-8", errors="replace").strip()
+        self._finish_explain_process(process)
+        QMessageBox.critical(self._window, "AI解释失败", detail or "模型子进程启动失败。")
+
+    def _on_explain_process_finished(
+        self,
+        process: QProcess,
+        exit_code: int,
+        _exit_status: QProcess.ExitStatus,
+    ) -> None:
+        if process is not self._explain_process:
+            return
+        if self._example_generator is None:
+            self._finish_explain_process(process)
+            return
+        stdout = bytes(process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        stderr = bytes(process.readAllStandardError()).decode("utf-8", errors="replace")
+        entry = self._explain_entry
+        self._finish_explain_process(process)
+        try:
+            data = self._example_generator.parse_isolated_result(stdout, stderr, exit_code)
+            explanation = str(data["explanation"]).strip()
+        except Exception as error:
+            QMessageBox.critical(self._window, "AI解释失败", str(error))
+            return
+        self._show_explanation_dialog(entry.word if entry is not None else "当前词", explanation)
+
+    def _finish_explain_process(self, process: QProcess) -> None:
+        self._explain_process = None
+        self._explain_entry = None
+        if self._explain_current_study_button is not None:
+            self._explain_current_study_button.setText("AI解释")
+            self._explain_current_study_button.setEnabled(True)
+        process.deleteLater()
+
+    def _show_explanation_dialog(self, word: str, explanation: str) -> None:
+        dialog = QDialog(self._window)
+        dialog.setWindowTitle(f"AI速解 - {word}")
+        dialog.setObjectName("appSurface")
+        dialog.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        dialog.resize(500, 320)
+        dialog.setMinimumSize(420, 260)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(10)
+        title = QLabel(word)
+        title.setObjectName("title")
+        layout.addWidget(title)
+        text = QPlainTextEdit(explanation)
+        text.setReadOnly(True)
+        layout.addWidget(text, 1)
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(self._button("关闭", dialog.accept, "primary"))
+        layout.addLayout(actions)
+        dialog.exec()
+
+    def _refresh_current_study_entry(self, entry_id: str) -> None:
+        self._study_session.reload()
+        self._render_study_card(self._study_session.show_entry_by_id(entry_id, record_history=False))
+
+    def _set_ai_scope(self, text: str) -> None:
+        self._ai_scope = text.strip()
+        if self._ai_scope_saver is None:
+            return
+        try:
+            self._ai_scope_saver(self._ai_scope)
+        except Exception:
+            return
+
     def _show_previous_word(self) -> None:
         state = self._study_session.show_previous_word()
         if state is not None:
             self._render_study_card(state)
 
     def _continue_from_history(self) -> None:
+        if self._current_card_state is None or not self._current_card_state.history_view:
+            return
         self._render_study_card(self._study_session.continue_from_history())
 
     def _show_word_list(self) -> None:
@@ -1089,20 +1392,24 @@ class WordPycketApp:
 
         panel = self._panel()
         panel_layout = QVBoxLayout(panel)
-        panel_layout.setContentsMargins(20, 20, 20, 20)
-        panel_layout.setSpacing(10)
+        panel_layout.setContentsMargins(22, 22, 22, 22)
+        panel_layout.setSpacing(12)
 
         search_row = QHBoxLayout()
+        search_row.setSpacing(10)
         search_row.addWidget(QLabel("搜索"))
         self._search_input = QLineEdit()
-        self._search_input.textChanged.connect(lambda _text: self._refresh_words(False))
+        self._search_input.textChanged.connect(self._safe_slot(lambda _text: self._refresh_words(False)))
         search_row.addWidget(self._search_input, 1)
         panel_layout.addLayout(search_row)
 
         scope_row = QHBoxLayout()
+        scope_row.setSpacing(10)
         scope_row.addWidget(QLabel("AI范围"))
-        self._scope_input = QLineEdit("人工智能相关的翻译")
+        self._scope_input = QLineEdit(self._ai_scope)
+        self._scope_input.textChanged.connect(self._safe_slot(self._set_ai_scope))
         scope_row.addWidget(self._scope_input, 1)
+        scope_row.addWidget(self._button("新增词条", self._show_add_word_dialog, "primary"))
         panel_layout.addLayout(scope_row)
 
         self._table = QTableWidget(0, 9)
@@ -1117,14 +1424,18 @@ class WordPycketApp:
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         for column, width in enumerate([56, 150, 230, 190, 220, 180, 70, 90, 90]):
             self._table.setColumnWidth(column, width)
-        self._table.itemSelectionChanged.connect(self._on_table_selection_changed)
-        self._table.itemDoubleClicked.connect(lambda item: self._edit_selected_word(item.row()))
+        self._table.itemSelectionChanged.connect(self._safe_slot(self._on_table_selection_changed))
+        self._table.itemDoubleClicked.connect(self._safe_slot(lambda item: self._edit_selected_word(item.row())))
         panel_layout.addWidget(self._table, 1)
 
         footer = QVBoxLayout()
+        footer.setSpacing(8)
+        status_row = QHBoxLayout()
         action_row = QHBoxLayout()
+        action_row.setSpacing(8)
         self._count_label = self._meta_label()
-        action_row.addWidget(self._count_label, 1)
+        status_row.addWidget(self._count_label, 1)
+        footer.addLayout(status_row)
         self._supplement_button = self._button("智能补充选中", self._supplement_selected_example)
         self._correct_button = self._button("智能修正选中", self._correct_selected_entry)
         self._upload_csv_button = self._button("上传 CSV", self._upload_csv)
@@ -1132,6 +1443,14 @@ class WordPycketApp:
         self._pause_button = self._button("暂停", self._toggle_batch_pause)
         self._stop_button = self._button("停止", self._stop_batch)
         delete_button = self._button("删除选中", self._delete_selected, "danger")
+        self._supplement_button.setMinimumWidth(126)
+        self._correct_button.setMinimumWidth(126)
+        self._upload_csv_button.setMinimumWidth(84)
+        self._upload_pdf_button.setMinimumWidth(84)
+        self._pause_button.setMinimumWidth(70)
+        self._stop_button.setMinimumWidth(70)
+        delete_button.setMinimumWidth(90)
+        action_row.addStretch()
         action_row.addWidget(self._upload_csv_button)
         action_row.addWidget(self._upload_pdf_button)
         action_row.addWidget(self._supplement_button)
@@ -1173,6 +1492,7 @@ class WordPycketApp:
         self._study_session.reset()
         self._selected_id = None
         self._selected_ids = []
+        self._current_language = result.language
         self._refresh_words(False)
         QMessageBox.information(
             self._window,
@@ -1192,21 +1512,138 @@ class WordPycketApp:
         )
         if not file_name:
             return
-        try:
-            result = self._pdf_import_loader(Path(file_name))
-        except Exception as error:
-            QMessageBox.critical(self._window, "PDF 解析失败", str(error))
+        use_llm_cleanup = self._should_use_llm_for_pdf_cleanup()
+        self._start_pdf_import(Path(file_name), use_llm_cleanup)
+
+    def _start_pdf_import(self, pdf_path: Path, use_llm_cleanup: bool) -> None:
+        if self._pdf_import_loader is None:
             return
+        if self._pdf_import_thread is not None:
+            QMessageBox.information(self._window, "PDF 正在导入", "请等待当前 PDF 导入完成。")
+            return
+        self._pdf_import_started_at = time.monotonic()
+        self._pdf_ai_started_at = 0.0
+        self._set_pdf_progress("准备上传 PDF", 0)
+        if self._upload_pdf_button is not None:
+            self._upload_pdf_button.setEnabled(False)
+
+        self._pdf_import_thread = QThread(self._window)
+        self._pdf_import_worker = PdfImportWorker(pdf_path, use_llm_cleanup, self._pdf_import_loader)
+        self._pdf_import_worker.moveToThread(self._pdf_import_thread)
+        self._pdf_import_thread.started.connect(self._safe_slot(self._pdf_import_worker.run))
+        self._pdf_import_worker.progress_changed.connect(self._safe_slot(self._set_pdf_progress))
+        self._pdf_import_worker.finished.connect(self._safe_slot(self._on_pdf_import_finished))
+        self._pdf_import_worker.failed.connect(self._safe_slot(self._on_pdf_import_failed))
+        self._pdf_import_worker.finished.connect(self._pdf_import_worker.deleteLater)
+        self._pdf_import_worker.failed.connect(self._pdf_import_worker.deleteLater)
+        self._pdf_import_worker.finished.connect(self._pdf_import_thread.quit)
+        self._pdf_import_worker.failed.connect(self._pdf_import_thread.quit)
+        self._pdf_import_thread.finished.connect(self._safe_slot(self._on_pdf_import_thread_finished))
+        self._pdf_import_thread.finished.connect(self._pdf_import_thread.deleteLater)
+        self._pdf_import_thread.start()
+
+    def _on_pdf_import_finished(self, result: PdfImportResult) -> None:
+        self._set_pdf_progress("PDF 导入完成", 100)
         self._study_session.clear_last_session()
         self._study_session.reset()
         self._selected_id = None
         self._selected_ids = []
+        self._current_language = result.language
         self._refresh_words(False)
         QMessageBox.information(
             self._window,
             "PDF 解析完成",
             f"已自动识别语言：{result.language}。\n已生成 {result.csv_path.name}，导入或更新 {result.imported_count} 个词条。",
         )
+        self._clear_batch_progress("PDF 导入完成")
+        self._pdf_import_started_at = 0.0
+        self._pdf_ai_started_at = 0.0
+        self._bring_window_to_front()
+
+    def _on_pdf_import_failed(self, message: str) -> None:
+        self._pdf_import_started_at = 0.0
+        self._pdf_ai_started_at = 0.0
+        self._clear_batch_progress("PDF 解析失败")
+        QMessageBox.critical(self._window, "PDF 解析失败", message)
+        self._bring_window_to_front()
+
+    def _on_pdf_import_thread_finished(self) -> None:
+        if self._upload_pdf_button is not None:
+            self._upload_pdf_button.setEnabled(True)
+        self._pdf_import_worker = None
+        self._pdf_import_thread = None
+
+    def _set_pdf_progress(self, message: str, percent: int) -> None:
+        percent = max(0, min(100, int(percent)))
+        if self._progress is not None:
+            self._progress.setValue(percent)
+        if self._batch_status_label is not None:
+            self._batch_status_label.setText(f"PDF 导入：{message} ({percent}%) | {self._pdf_eta_text(message, percent)}")
+
+    def _pdf_eta_text(self, message: str, percent: int) -> str:
+        if percent >= 100:
+            elapsed = time.monotonic() - self._pdf_import_started_at
+            return f"耗时：{self._format_duration(elapsed)}"
+        batch_progress = self._pdf_ai_batch_progress(message)
+        if batch_progress is None:
+            return "当前阶段：进行中"
+        done, total, is_completed_update = batch_progress
+        if total <= 0:
+            return "AI 预估剩余：估算中"
+        if self._pdf_ai_started_at <= 0:
+            self._pdf_ai_started_at = time.monotonic()
+        completed = done if is_completed_update else done - 1
+        if completed <= 0:
+            return f"AI 进度：{done}/{total} | 预估剩余：估算中"
+        elapsed = time.monotonic() - self._pdf_ai_started_at
+        remaining = elapsed * (total - completed) / max(1, completed)
+        return f"AI 进度：{done}/{total} | 预估剩余：{self._format_duration(remaining)}"
+
+    @staticmethod
+    def _pdf_ai_batch_progress(message: str) -> tuple[int, int, bool] | None:
+        match = re.search(r"AI 审阅 CSV：(?:已完成 )?(\d+)/(\d+)", message)
+        if match is None:
+            return None
+        return int(match.group(1)), int(match.group(2)), "已完成" in message
+
+    def _should_use_llm_for_pdf_cleanup(self) -> bool:
+        if self._example_generator is None:
+            return False
+        if not hasattr(self._example_generator, "model_status"):
+            return False
+        if self._has_local_llm_model():
+            return True
+        return self._confirm_model_download(
+            "PDF 词表优化",
+            no_text="选择“否”将使用普通词频统计导入 PDF，不进行 LLM 清理。",
+        )
+
+    def _has_local_llm_model(self) -> bool:
+        if self._example_generator is None or not hasattr(self._example_generator, "model_status"):
+            return False
+        try:
+            status = self._example_generator.model_status()
+        except Exception:
+            return False
+        return getattr(status, "path", None) is not None
+
+    def _confirm_model_download(self, action: str, no_text: str = "") -> bool:
+        if self._has_local_llm_model():
+            return True
+        message = (
+            f"{action}需要本地 LLM 模型，但 model 目录中还没有 .gguf 模型。\n"
+            "是否下载默认模型？下载完成后会保存在 model 目录，以后智能补充、智能修正和 PDF 词表优化都会复用它。"
+        )
+        if no_text:
+            message = f"{message}\n\n{no_text}"
+        answer = QMessageBox.question(
+            self._window,
+            "下载默认模型？",
+            message,
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        return answer == QMessageBox.StandardButton.Yes
 
     def _visible_word_entries(self, query: str = "") -> list[WordEntry]:
         if self._mode in {"learning", "review"}:
@@ -1343,7 +1780,7 @@ class WordPycketApp:
             return
         self._show_word_editor(entry)
 
-    def _show_word_editor(self, entry: WordEntry) -> None:
+    def _show_word_editor(self, entry: WordEntry, refresh_after_save: Callable[[WordEntry], None] | None = None) -> None:
         dialog = QDialog(self._window)
         dialog.setWindowTitle(f"编辑词条 - {entry.word}")
         dialog.setObjectName("appSurface")
@@ -1413,11 +1850,91 @@ class WordPycketApp:
                 return
             self._selected_id = updated.id if updated else entry.id
             self._selected_ids = [self._selected_id]
+            if updated is not None and refresh_after_save is not None:
+                refresh_after_save(updated)
+            else:
+                self._refresh_words(False)
+                self._restore_table_selection(self._selected_ids)
+            dialog.accept()
+
+        actions.addWidget(self._button("保存", save, "primary"))
+        form.addLayout(actions, 5, 0, 1, 2)
+        layout.addWidget(panel)
+        dialog.exec()
+
+    def _show_add_word_dialog(self) -> None:
+        dialog = QDialog(self._window)
+        dialog.setWindowTitle("新增词条")
+        dialog.setObjectName("appSurface")
+        dialog.resize(700, 560)
+        dialog.setMinimumSize(620, 500)
+        layout = QVBoxLayout(dialog)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.setSpacing(16)
+
+        title = QLabel("新增词条")
+        title.setObjectName("homeTitle")
+        subtitle = self._meta_label("新词会插入到 Index 1 之前，并自动重排 Index。")
+        layout.addWidget(title)
+        layout.addWidget(subtitle)
+
+        panel = self._panel()
+        form = QGridLayout(panel)
+        form.setContentsMargins(24, 24, 24, 24)
+        form.setHorizontalSpacing(14)
+        form.setVerticalSpacing(12)
+        form.setColumnStretch(1, 1)
+
+        word_input = QLineEdit()
+        meaning_input = QLineEdit()
+        forms_input = QLineEdit()
+        example_input = QPlainTextEdit()
+        example_cn_input = QPlainTextEdit()
+        example_input.setMinimumHeight(96)
+        example_cn_input.setMinimumHeight(96)
+        form.addWidget(self._form_label("单词"), 0, 0)
+        form.addWidget(word_input, 0, 1)
+        form.addWidget(self._form_label("释义"), 1, 0)
+        form.addWidget(meaning_input, 1, 1)
+        form.addWidget(self._form_label("词形"), 2, 0)
+        form.addWidget(forms_input, 2, 1)
+        form.addWidget(self._form_label("例句"), 3, 0, Qt.AlignmentFlag.AlignTop)
+        form.addWidget(example_input, 3, 1)
+        form.addWidget(self._form_label("例句中文"), 4, 0, Qt.AlignmentFlag.AlignTop)
+        form.addWidget(example_cn_input, 4, 1)
+
+        actions = QHBoxLayout()
+        actions.addStretch()
+        actions.addWidget(self._button("取消", dialog.reject))
+
+        def save() -> None:
+            word = word_input.text().strip()
+            meaning = meaning_input.text().strip()
+            forms = forms_input.text().strip()
+            if not word:
+                QMessageBox.information(dialog, "无法新增", "单词不能为空。")
+                return
+            if not meaning:
+                QMessageBox.information(dialog, "无法新增", "释义不能为空。")
+                return
+            try:
+                entry = self._service.insert_word_at_front(
+                    word,
+                    meaning,
+                    forms,
+                    example_input.toPlainText().strip(),
+                    example_cn_input.toPlainText().strip(),
+                )
+            except Exception as error:
+                QMessageBox.critical(dialog, "新增失败", str(error))
+                return
+            self._selected_id = entry.id
+            self._selected_ids = [entry.id]
             self._refresh_words(False)
             self._restore_table_selection(self._selected_ids)
             dialog.accept()
 
-        actions.addWidget(self._button("保存", save, "primary"))
+        actions.addWidget(self._button("新增", save, "primary"))
         form.addLayout(actions, 5, 0, 1, 2)
         layout.addWidget(panel)
         dialog.exec()
@@ -1438,6 +1955,8 @@ class WordPycketApp:
         if self._example_generator is None:
             QMessageBox.information(self._window, f"无法智能{action}", "未配置本地模型生成器。")
             return
+        if not self._confirm_model_download(f"智能{action}"):
+            return
         entries = self._entries_by_id(selected_ids)
         if not entries:
             QMessageBox.information(self._window, f"智能{action}失败", "当前词条不存在。")
@@ -1451,7 +1970,7 @@ class WordPycketApp:
             return
         self._warn_if_using_user_model()
 
-        scope = self._scope_input.text().strip() if self._scope_input is not None else ""
+        scope = self._ai_scope
         self._set_batch_running()
         if action == "补充":
             self._supplement_button.setText(f"补充中 0/{len(entries)}")
@@ -1556,17 +2075,17 @@ class WordPycketApp:
             environment.insert(key, value)
         process.setProcessEnvironment(environment)
         process.started.connect(
-            lambda process=process, payload=payload: self._write_batch_process_payload(process, payload)
+            self._safe_slot(lambda process=process, payload=payload: self._write_batch_process_payload(process, payload))
         )
         process.finished.connect(
-            lambda exit_code, exit_status, process=process: self._on_batch_process_finished(
+            self._safe_slot(lambda exit_code, exit_status, process=process: self._on_batch_process_finished(
                 process,
                 exit_code,
                 exit_status,
-            )
+            ))
         )
         process.errorOccurred.connect(
-            lambda error, process=process: self._on_batch_process_error(process, error)
+            self._safe_slot(lambda error, process=process: self._on_batch_process_error(process, error))
         )
         self._batch_processes[process] = entry
         process.start()

@@ -72,6 +72,33 @@ def test_pdf_vocabulary_importer_writes_csv_compatible_with_csv_importer(tmp_pat
     assert result.entries[0].frequency > 0
 
 
+def test_pdf_vocabulary_importer_cleans_with_llm_and_reindexes(tmp_path, monkeypatch) -> None:
+    class FakeCleaner:
+        def clean_pdf_vocabulary_entries(self, entries, language, progress_callback=None):
+            assert language == "英语"
+            if progress_callback is not None:
+                progress_callback("fake clean", 80)
+            return [entry for entry in entries if entry.word != "john"]
+
+    pdf_path = tmp_path / "source.pdf"
+    csv_path = tmp_path / "word_frequency.csv"
+    monkeypatch.setattr(
+        PdfVocabularyImporter,
+        "extract_text",
+        staticmethod(lambda _path: "John wrote code. Machine learning improves systems."),
+    )
+    monkeypatch.setattr(
+        PdfVocabularyImporter,
+        "_nltk_lemma_counts",
+        classmethod(lambda _cls, counts: [(word, count, "") for word, count in counts.items()]),
+    )
+
+    result = PdfVocabularyImporter(pdf_path, csv_path, vocabulary_cleaner=FakeCleaner()).build()
+
+    assert "john" not in {entry.word for entry in result.entries}
+    assert [entry.source_index for entry in result.entries] == list(range(1, len(result.entries) + 1))
+
+
 def test_pdf_vocabulary_importer_ignores_formulas_urls_and_noise() -> None:
     text = """
     E = mc^2 + \\alpha / \\beta
@@ -148,6 +175,42 @@ def test_pdf_vocabulary_importer_keeps_fixed_phrase_and_skips_generic_extension(
     assert "random" not in terms
     assert "forest" not in terms
     assert "random forest model" not in terms
+
+
+def test_pdf_vocabulary_importer_keeps_eponym_technical_bigram() -> None:
+    text = (
+        "Laplace law describes membrane tension. "
+        "Laplace law appears in physiology. "
+        "The Fourier transform analyzes signals."
+    )
+
+    entries, language, _schema = PdfVocabularyImporter.entries_from_text(text)
+
+    assert language == "英语"
+    terms = {entry.word: entry.frequency for entry in entries}
+    assert terms["laplace law"] == 2
+    assert terms["fourier transform"] == 1
+    assert "laplace" not in terms
+    assert "law" not in terms
+
+
+def test_pdf_vocabulary_importer_keeps_common_technical_bigrams_without_ai() -> None:
+    text = (
+        "Surface tension changes pressure. "
+        "Surface tension affects droplets. "
+        "Linear equation systems are solved. "
+        "A normal distribution models noise. "
+        "The paper result appears in a table."
+    )
+
+    entries, language, _schema = PdfVocabularyImporter.entries_from_text(text)
+
+    assert language == "英语"
+    terms = {entry.word: entry.frequency for entry in entries}
+    assert terms["surface tension"] == 2
+    assert terms["linear equation"] == 1
+    assert terms["normal distribution"] == 1
+    assert "paper result" not in terms
 
 
 def test_pdf_vocabulary_importer_groups_german_forms_under_lemma(monkeypatch) -> None:

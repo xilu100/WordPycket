@@ -180,3 +180,120 @@ def test_definitely_known_enters_review_pool_without_becoming_learned() -> None:
     assert entry.status == "复习池"
     assert entry.is_in_review_pool
     assert entry.learned_available_at is None
+
+
+def test_frequency_weight_mildly_prefers_frequent_words_without_dominating() -> None:
+    low = WordEntry(word="rare", meaning="少见", frequency=1)
+    high = WordEntry(word="common", meaning="常见", frequency=10_000)
+
+    low_weight = StudySessionController._study_weight(low, high.frequency)
+    high_weight = StudySessionController._study_weight(high, high.frequency)
+
+    assert low_weight > 1.0
+    assert high_weight == 1.6
+    assert high_weight / low_weight < 1.6
+
+
+def test_frequency_weight_falls_back_when_frequency_is_missing() -> None:
+    entry = WordEntry(word="unknown", meaning="未知", frequency=0)
+
+    assert StudySessionController._study_weight(entry, 0) == 1.0
+
+
+def test_delete_current_removes_entry_and_continues_session() -> None:
+    first = WordEntry(word="remove", meaning="删除")
+    second = WordEntry(word="keep", meaning="保留")
+    repository = InMemoryWordRepository([first, second])
+    service = WordService(repository)
+    session = StudySessionController(service)
+
+    state = session.begin("learning")
+    assert state.entry is not None
+    deleted_id = state.entry.id
+
+    next_state = session.delete_current()
+
+    assert service.get_word(deleted_id) is None
+    assert next_state is not None
+    assert next_state.kind in {"entry", "complete"}
+    if next_state.kind == "entry":
+        assert next_state.entry is not None
+        assert next_state.entry.id != deleted_id
+
+
+def test_mark_buttons_advance_to_next_normal_card_without_next_button() -> None:
+    first = WordEntry(word="first", meaning="第一")
+    second = WordEntry(word="second", meaning="第二")
+    service = WordService(InMemoryWordRepository([first, second]))
+    session = StudySessionController(service)
+
+    state = session.begin("learning")
+    assert state.entry is not None
+    first_id = state.entry.id
+
+    next_state = session.mark_current("known")
+
+    assert next_state is not None
+    assert next_state.kind == "entry"
+    assert next_state.entry is not None
+    assert next_state.entry.id != first_id
+    assert next_state.history_view is False
+    assert next_state.can_show_next is False
+
+
+def test_next_button_is_only_for_history_view() -> None:
+    first = WordEntry(word="first", meaning="第一")
+    second = WordEntry(word="second", meaning="第二")
+    service = WordService(InMemoryWordRepository([first, second]))
+    session = StudySessionController(service)
+
+    first_state = session.begin("learning")
+    assert first_state.can_show_next is False
+    session.mark_current("known")
+
+    history_state = session.show_previous_word()
+
+    assert history_state is not None
+    assert history_state.history_view is True
+    assert history_state.can_show_next is True
+
+
+def test_history_next_returns_to_current_sequence_word_without_redrawing() -> None:
+    entries = [
+        WordEntry(word="first", meaning="第一"),
+        WordEntry(word="second", meaning="第二"),
+        WordEntry(word="third", meaning="第三"),
+    ]
+    service = WordService(InMemoryWordRepository(entries))
+    session = StudySessionController(service)
+
+    first_state = session.begin("learning")
+    assert first_state.entry is not None
+    second_state = session.mark_current("known")
+    assert second_state is not None
+    assert second_state.entry is not None
+    current_id = second_state.entry.id
+
+    history_state = session.show_previous_word()
+    assert history_state is not None
+    assert history_state.history_view is True
+
+    resumed_state = session.continue_from_history()
+
+    assert resumed_state.entry is not None
+    assert resumed_state.entry.id == current_id
+    assert resumed_state.history_view is False
+
+
+def test_insert_word_at_front_uses_max_frequency_and_reindexes() -> None:
+    first = WordEntry(word="alpha", meaning="阿尔法", source_index=1, frequency=7)
+    second = WordEntry(word="beta", meaning="贝塔", source_index=2, frequency=3)
+    service = WordService(InMemoryWordRepository([first, second]))
+
+    inserted = service.insert_word_at_front("gamma", "伽马")
+
+    entries = service.list_words()
+    assert inserted.source_index == 1
+    assert inserted.frequency == 7
+    assert [entry.word for entry in entries] == ["gamma", "alpha", "beta"]
+    assert [entry.source_index for entry in entries] == [1, 2, 3]

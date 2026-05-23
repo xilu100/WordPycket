@@ -1,4 +1,5 @@
 import random
+import math
 from dataclasses import dataclass
 from typing import Literal
 
@@ -16,6 +17,7 @@ class StudyCardState:
     entry: WordEntry | None = None
     history_view: bool = False
     can_show_previous: bool = False
+    can_show_next: bool = False
     meta_text: str = ""
     word_text: str = ""
     meaning_text: str = ""
@@ -41,6 +43,9 @@ class StudySessionController:
         self._last_session_seen_ids: set[str] = set()
         self._last_session_mode: StudyMode | None = None
         self._entry_index = 0
+        self._sequence_ids: list[str] = []
+        self._sequence_position = -1
+        self._resume_entry_id: str | None = None
 
     @property
     def mode(self) -> StudyMode | None:
@@ -72,6 +77,9 @@ class StudySessionController:
         self._history_position = -1
         self._session_seen_ids = set()
         self._entry_index = 0
+        self._sequence_ids = []
+        self._sequence_position = -1
+        self._resume_entry_id = None
 
     def clear_last_session(self) -> None:
         self._last_session_seen_ids = set()
@@ -86,16 +94,21 @@ class StudySessionController:
         self._history_position = -1
         self._session_seen_ids = set()
         self._entry_index = 0
+        self._sequence_ids = []
+        self._sequence_position = -1
+        self._resume_entry_id = None
         return self.reload()
 
     def reload(self, selected_id: str | None = None) -> StudyCardState:
-        self._entries = self.mode_entries()
+        self._entries = self._weighted_random_order(self.mode_entries())
+        self._sequence_ids = [entry.id for entry in self._entries]
+        self._sequence_position = -1
         if not self._entries:
             return self._empty_state()
 
         if selected_id is not None:
             return self.show_entry_by_id(selected_id)
-        return self.show_random_word()
+        return self.show_next_word()
 
     def mode_entries(self, query: str = "") -> list[WordEntry]:
         entries = self._service.list_words(query)
@@ -116,12 +129,16 @@ class StudySessionController:
         entry_id: str,
         history_view: bool = False,
         record_history: bool = True,
+        allow_seen_normal: bool = False,
     ) -> StudyCardState:
         entry = self._find_entry_by_id(entry_id, allow_outside_pool=history_view)
         if entry is None:
-            return self.show_random_word()
+            return self.show_next_word()
 
         is_reopened_seen_entry = (
+            not allow_seen_normal
+            and not history_view
+            and
             entry.id in self._session_seen_ids
             and (
                 self._current_entry is None
@@ -131,6 +148,9 @@ class StudySessionController:
         is_history_view = history_view or is_reopened_seen_entry
         if is_history_view:
             self._history_position = self._history_index(entry.id)
+        sequence_index = self._sequence_index_for(entry.id)
+        if sequence_index >= 0 and not is_history_view:
+            self._sequence_position = sequence_index
         self._entry_index = self._entry_index_for(entry.id)
         return self._entry_state(
             entry,
@@ -139,19 +159,21 @@ class StudySessionController:
         )
 
     def show_random_word(self) -> StudyCardState:
-        if not self._entries:
-            return self._complete_state()
+        return self.show_next_word()
 
-        candidates = [
-            (index, entry)
-            for index, entry in enumerate(self._entries)
-            if entry.id not in self._session_seen_ids
-        ]
-        if not candidates:
-            return self._complete_state()
+    def show_next_word(self) -> StudyCardState:
+        while self._sequence_position + 1 < len(self._sequence_ids):
+            self._sequence_position += 1
+            entry_id = self._sequence_ids[self._sequence_position]
+            if entry_id in self._session_seen_ids:
+                continue
+            entry = self._find_entry_by_id(entry_id, allow_outside_pool=True)
+            if entry is None:
+                continue
+            self._entry_index = self._entry_index_for(entry.id)
+            return self._entry_state(entry)
 
-        self._entry_index, entry = self._weighted_random_choice(candidates)
-        return self._entry_state(entry)
+        return self._complete_state()
 
     def show_previous_word(self) -> StudyCardState | None:
         if not self._history:
@@ -161,6 +183,8 @@ class StudySessionController:
             if self._history_position <= 0:
                 return None
             self._history_position -= 1
+        elif self._current_entry is not None:
+            self._resume_entry_id = self._current_entry.id
 
         previous_id = self._history[self._history_position]
         return self.show_entry_by_id(previous_id, history_view=True, record_history=False)
@@ -171,7 +195,17 @@ class StudySessionController:
             next_id = self._history[self._history_position]
             return self.show_entry_by_id(next_id, history_view=True, record_history=False)
 
-        return self.show_random_word()
+        if self._resume_entry_id is not None:
+            resume_entry_id = self._resume_entry_id
+            self._resume_entry_id = None
+            return self.show_entry_by_id(
+                resume_entry_id,
+                history_view=False,
+                record_history=False,
+                allow_seen_normal=True,
+            )
+
+        return self.show_next_word()
 
     def mark_current(self, result: MarkResult) -> StudyCardState | None:
         if self._current_entry is None:
@@ -186,8 +220,27 @@ class StudySessionController:
             self._service.mark_unknown(current_id)
 
         self._record_history(current_id)
-        self._entries = self.mode_entries()
-        return self.show_random_word()
+        self._refresh_sequence_entries()
+        return self.show_next_word()
+
+    def delete_current(self) -> StudyCardState | None:
+        if self._current_entry is None:
+            return None
+
+        entry_id = self._current_entry.id
+        self._service.delete_word(entry_id)
+        self._history = [history_id for history_id in self._history if history_id != entry_id]
+        self._history_position = min(self._history_position, len(self._history) - 1)
+        self._session_seen_ids.discard(entry_id)
+        self._last_session_seen_ids.discard(entry_id)
+        self._entries = [entry for entry in self._entries if entry.id != entry_id]
+        self._sequence_ids = [sequence_id for sequence_id in self._sequence_ids if sequence_id != entry_id]
+        self._sequence_position = min(self._sequence_position, len(self._sequence_ids) - 1)
+        if self._resume_entry_id == entry_id:
+            self._resume_entry_id = None
+        self._current_entry = None
+        self._current_is_history_view = False
+        return self.show_next_word()
 
     def _empty_state(self) -> StudyCardState:
         self._current_entry = None
@@ -245,6 +298,7 @@ class StudySessionController:
             entry=entry,
             history_view=history_view,
             can_show_previous=self._can_show_previous(history_view),
+            can_show_next=history_view,
             word_text=entry.word,
             meaning_text=entry.meaning,
             forms_text=f"词形: {entry.forms}" if entry.forms else "",
@@ -272,13 +326,61 @@ class StudySessionController:
                 return index
         return self._entry_index
 
+    def _sequence_index_for(self, entry_id: str) -> int:
+        try:
+            return self._sequence_ids.index(entry_id)
+        except ValueError:
+            return -1
+
+    def _refresh_sequence_entries(self) -> None:
+        latest_entries = {entry.id: entry for entry in self._service.list_words()}
+        refreshed_entries: list[WordEntry] = []
+        refreshed_ids: list[str] = []
+        for entry_id in self._sequence_ids:
+            entry = latest_entries.get(entry_id)
+            if entry is None:
+                continue
+            refreshed_entries.append(entry)
+            refreshed_ids.append(entry_id)
+        self._entries = refreshed_entries
+        self._sequence_ids = refreshed_ids
+
     @staticmethod
     def _weighted_random_choice(candidates: list[tuple[int, WordEntry]]) -> tuple[int, WordEntry]:
+        max_frequency = max((entry.frequency for _index, entry in candidates), default=0)
         weights = [
-            (entry.wrong_count + 1) / (entry.correct_count + 1)
+            StudySessionController._study_weight(entry, max_frequency)
             for _index, entry in candidates
         ]
         return random.choices(candidates, weights=weights, k=1)[0]
+
+    @staticmethod
+    def _weighted_random_order(entries: list[WordEntry]) -> list[WordEntry]:
+        remaining = list(entries)
+        ordered: list[WordEntry] = []
+        max_frequency = max((entry.frequency for entry in remaining), default=0)
+        while remaining:
+            weights = [
+                StudySessionController._study_weight(entry, max_frequency)
+                for entry in remaining
+            ]
+            selected = random.choices(remaining, weights=weights, k=1)[0]
+            ordered.append(selected)
+            remaining.remove(selected)
+        return ordered
+
+    @staticmethod
+    def _study_weight(entry: WordEntry, max_frequency: int) -> float:
+        learning_weight = (entry.wrong_count + 1) / (entry.correct_count + 1)
+        frequency_weight = StudySessionController._frequency_weight(entry.frequency, max_frequency)
+        return learning_weight * frequency_weight
+
+    @staticmethod
+    def _frequency_weight(frequency: int, max_frequency: int) -> float:
+        if frequency <= 0 or max_frequency <= 0:
+            return 1.0
+        normalized = math.log1p(frequency) / math.log1p(max_frequency)
+        return 1.0 + min(0.6, normalized * 0.6)
 
     def _record_history(self, entry_id: str) -> None:
         if self._history_position < len(self._history) - 1:

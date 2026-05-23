@@ -1,5 +1,6 @@
 import random
 import re
+from dataclasses import replace
 
 from wordpycket.domain.entities import WordEntry
 from wordpycket.domain.repositories import WordRepository
@@ -105,6 +106,32 @@ class WordService:
 
     def replace_words(self, entries: list[WordEntry]) -> int:
         return self._repository.replace_all(entries)
+
+    def insert_word_at_front(
+        self,
+        word: str,
+        meaning: str,
+        forms: str = "",
+        example_sentence: str = "",
+        example_sentence_cn: str = "",
+    ) -> WordEntry:
+        entries = self.list_words()
+        max_frequency = max((entry.frequency for entry in entries), default=0)
+        new_entry = WordEntry(
+            source_index=1,
+            word=word,
+            meaning=meaning,
+            frequency=max_frequency,
+            forms=forms,
+            example_sentence=example_sentence,
+            example_sentence_cn=example_sentence_cn,
+        )
+        reindexed_entries = [new_entry] + [
+            replace(entry, source_index=index)
+            for index, entry in enumerate(entries, start=2)
+        ]
+        self._repository.replace_all(reindexed_entries)
+        return new_entry
 
     def update_examples(
         self,

@@ -1,9 +1,9 @@
 import csv
 import re
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Protocol
 
 from PySide6.QtPdf import QPdfDocument
 
@@ -26,12 +26,25 @@ class LanguageProfile:
     markers: frozenset[str]
 
 
+class VocabularyCleaner(Protocol):
+    def clean_pdf_vocabulary_entries(
+        self,
+        entries: list[WordEntry],
+        language: str,
+        progress_callback: Callable[[str, int], None] | None = None,
+    ) -> list[WordEntry]: ...
+
+
 class PdfVocabularyImporter:
     _LATIN_TOKEN = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:[-'][A-Za-zÀ-ÖØ-öø-ÿ]+)*")
     _CJK_RUN = re.compile(r"[\u3040-\u30ff\u3400-\u9fff\uac00-\ud7af]+")
     _KNOWN_COMPOUNDS = {
         "artificial intelligence",
         "deep learning",
+        "fourier transform",
+        "gaussian distribution",
+        "laplace law",
+        "laplace transform",
         "machine learning",
         "natural language",
         "neural network",
@@ -61,6 +74,195 @@ class PdfVocabularyImporter:
         "systems",
         "technique",
         "techniques",
+    }
+    _GENERIC_PHRASE_STARTERS = {
+        "article",
+        "chapter",
+        "experiment",
+        "paper",
+        "result",
+        "results",
+        "section",
+        "study",
+        "table",
+    }
+    _GENERIC_PHRASE_HEADS = {
+        "approach",
+        "approaches",
+        "data",
+        "example",
+        "examples",
+        "information",
+        "paper",
+        "papers",
+        "result",
+        "results",
+        "study",
+        "studies",
+        "system",
+        "systems",
+        "thing",
+        "things",
+        "work",
+    }
+    _EPONYM_TERMS = {
+        "bayes",
+        "bayesian",
+        "euler",
+        "eulerian",
+        "fourier",
+        "gauss",
+        "gaussian",
+        "hamilton",
+        "hamiltonian",
+        "laplace",
+        "markov",
+        "newton",
+        "newtonian",
+        "turing",
+    }
+    _EPONYM_HEAD_NOUNS = {
+        "algorithm",
+        "algorithms",
+        "analysis",
+        "approximation",
+        "distribution",
+        "distributions",
+        "equation",
+        "equations",
+        "filter",
+        "filters",
+        "kernel",
+        "kernels",
+        "law",
+        "laws",
+        "matrix",
+        "matrices",
+        "method",
+        "methods",
+        "model",
+        "models",
+        "operator",
+        "operators",
+        "process",
+        "processes",
+        "series",
+        "space",
+        "theorem",
+        "theorems",
+        "transform",
+        "transforms",
+    }
+    _TECHNICAL_HEAD_NOUNS = _EPONYM_HEAD_NOUNS | {
+        "architecture",
+        "architectures",
+        "boundary",
+        "boundaries",
+        "coefficient",
+        "coefficients",
+        "condition",
+        "conditions",
+        "constraint",
+        "constraints",
+        "density",
+        "derivative",
+        "derivatives",
+        "energy",
+        "feature",
+        "features",
+        "field",
+        "fields",
+        "flow",
+        "flows",
+        "force",
+        "forces",
+        "function",
+        "functions",
+        "gradient",
+        "gradients",
+        "layer",
+        "layers",
+        "loss",
+        "network",
+        "networks",
+        "parameter",
+        "parameters",
+        "pressure",
+        "probability",
+        "representation",
+        "representations",
+        "signal",
+        "signals",
+        "state",
+        "states",
+        "structure",
+        "structures",
+        "stress",
+        "stresses",
+        "temperature",
+        "temperatures",
+        "tension",
+        "tensions",
+        "tensor",
+        "tensors",
+        "variable",
+        "variables",
+        "vector",
+        "vectors",
+        "wave",
+        "waves",
+        "weight",
+        "weights",
+    }
+    _TECHNICAL_MODIFIERS = {
+        "absolute",
+        "active",
+        "adaptive",
+        "angular",
+        "average",
+        "binary",
+        "boundary",
+        "canonical",
+        "central",
+        "conditional",
+        "continuous",
+        "convex",
+        "critical",
+        "deep",
+        "differential",
+        "discrete",
+        "dynamic",
+        "elastic",
+        "electric",
+        "empirical",
+        "finite",
+        "global",
+        "hidden",
+        "linear",
+        "local",
+        "logical",
+        "magnetic",
+        "maximum",
+        "minimum",
+        "molecular",
+        "neural",
+        "normal",
+        "optimal",
+        "partial",
+        "physical",
+        "potential",
+        "probability",
+        "random",
+        "relative",
+        "residual",
+        "spectral",
+        "statistical",
+        "stochastic",
+        "surface",
+        "thermal",
+        "total",
+        "transition",
+        "virtual",
     }
     _SPACY_MODELS = {
         "英语": ("en_core_web_sm", "en_core_web_md", "en_core_web_lg"),
@@ -222,16 +424,45 @@ class PdfVocabularyImporter:
         ),
     )
 
-    def __init__(self, pdf_path: Path, csv_path: Path, max_entries: int = 10000) -> None:
+    def __init__(
+        self,
+        pdf_path: Path,
+        csv_path: Path,
+        max_entries: int = 10000,
+        vocabulary_cleaner: VocabularyCleaner | None = None,
+        progress_callback: Callable[[str, int], None] | None = None,
+    ) -> None:
         self._pdf_path = pdf_path
         self._csv_path = csv_path
         self._max_entries = max_entries
+        self._vocabulary_cleaner = vocabulary_cleaner
+        self._progress_callback = progress_callback
 
     def build(self) -> PdfVocabularyImportResult:
+        self._report_progress("读取 PDF 文本", 5)
         text = self.extract_text(self._pdf_path)
+        self._report_progress("统计词频并生成粗制词表", 20)
         entries, language, schema = self.entries_from_text(text, self._max_entries)
+        self._report_progress("写入粗制 CSV", 35)
         self.write_csv(entries, schema, self._csv_path)
+        if self._vocabulary_cleaner is not None:
+            self._report_progress("AI 审阅粗制 CSV", 40)
+            entries = self._vocabulary_cleaner.clean_pdf_vocabulary_entries(
+                entries,
+                language,
+                progress_callback=self._progress_callback,
+            )
+            entries = self.reindex_entries(entries)
+            if not entries:
+                raise RuntimeError("LLM 清理后没有保留可导入的词条。")
+            self._report_progress("写回 AI 清理后的 CSV", 85)
+            self.write_csv(entries, schema, self._csv_path)
+        self._report_progress("PDF 词表生成完成", 90)
         return PdfVocabularyImportResult(entries=entries, language=language, csv_path=self._csv_path)
+
+    def _report_progress(self, message: str, percent: int) -> None:
+        if self._progress_callback is not None:
+            self._progress_callback(message, percent)
 
     @staticmethod
     def extract_text(pdf_path: Path) -> str:
@@ -487,6 +718,26 @@ class PdfVocabularyImporter:
         phrase = " ".join(bigram)
         if phrase in cls._KNOWN_COMPOUNDS:
             return True
+        if cls._is_eponym_bigram(bigram):
+            return True
+        if cls._is_technical_bigram(bigram, count):
+            return True
+        return False
+
+    @classmethod
+    def _is_eponym_bigram(cls, bigram: tuple[str, str]) -> bool:
+        first, second = bigram
+        return first in cls._EPONYM_TERMS and second in cls._EPONYM_HEAD_NOUNS
+
+    @classmethod
+    def _is_technical_bigram(cls, bigram: tuple[str, str], count: int) -> bool:
+        first, second = bigram
+        if first in cls._GENERIC_PHRASE_STARTERS or second in cls._GENERIC_PHRASE_HEADS:
+            return False
+        if first in cls._TECHNICAL_MODIFIERS and second in cls._TECHNICAL_HEAD_NOUNS:
+            return True
+        if count >= 2 and second in cls._TECHNICAL_HEAD_NOUNS:
+            return True
         return False
 
     @classmethod
@@ -728,3 +979,10 @@ class PdfVocabularyImporter:
                         schema.forms: entry.forms,
                     }
                 )
+
+    @staticmethod
+    def reindex_entries(entries: list[WordEntry]) -> list[WordEntry]:
+        return [
+            replace(entry, source_index=index)
+            for index, entry in enumerate(entries, start=1)
+        ]

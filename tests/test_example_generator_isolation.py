@@ -77,6 +77,40 @@ def test_isolated_generation_can_fill_empty_chinese_meaning(monkeypatch: pytest.
     assert result.meaning == "内核"
 
 
+def test_isolated_explanation_reads_child_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    payloads = []
+
+    def fake_run(*_args, **_kwargs):
+        payloads.append(json.loads(_kwargs["input"]))
+        return subprocess.CompletedProcess(
+            args=[],
+            returncode=0,
+            stdout=json.dumps({"explanation": "vector 表示有大小和方向的量。"}, ensure_ascii=False),
+            stderr="",
+        )
+
+    monkeypatch.setattr(subprocess, "run", fake_run)
+    generator = LocalLlmExampleGenerator(model_dir=__file__)
+
+    result = generator.explain_entry_isolated(WordEntry(word="vector", meaning="向量"), language="英语")
+
+    assert payloads[0]["language"] == "英语"
+    assert result.explanation == "vector 表示有大小和方向的量。"
+
+
+def test_explanation_prompt_targets_vocabulary_language_not_chinese_translation() -> None:
+    prompt = LocalLlmExampleGenerator._build_explanation_prompt(
+        WordEntry(word="Entlassung", meaning="出院；解雇"),
+        "医学",
+        "德语",
+    )
+
+    assert "Target vocabulary language: 德语" in prompt
+    assert "target-language usage" in prompt
+    assert "Do not explain how the Chinese translation is used in Chinese" in prompt
+    assert "only a reference to disambiguate the vocabulary item" in prompt
+
+
 def test_generation_requires_chinese_meaning_only_when_entry_meaning_is_empty(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -293,3 +327,111 @@ def test_check_model_runtime_runs_smoke_test(monkeypatch: pytest.MonkeyPatch) ->
     assert result.device.selected == "cpu"
     assert result.smoke_test_passed is True
     assert smoke_calls == [True]
+
+
+def test_pdf_vocabulary_cleaner_removes_model_selected_indexes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLlm:
+        def create_chat_completion(self, **kwargs):
+            prompt = kwargs["messages"][1]["content"]
+            assert "vocabulary CSV rows" in kwargs["messages"][0]["content"]
+            assert "john" in prompt
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {"remove_source_indexes": [2]},
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: FakeLlm())
+    entries = [
+        WordEntry(source_index=1, word="machine learning", meaning="", frequency=4),
+        WordEntry(source_index=2, word="john", meaning="", frequency=2),
+        WordEntry(source_index=3, word="translation", meaning="", frequency=1),
+    ]
+
+    cleaned = generator.clean_pdf_vocabulary_entries(entries, "英语")
+
+    assert [entry.word for entry in cleaned] == ["machine learning", "translation"]
+    assert [entry.source_index for entry in cleaned] == [1, 2]
+
+
+def test_pdf_vocabulary_cleaner_accepts_batch_row_numbers() -> None:
+    batch = [
+        WordEntry(source_index=101, word="machine learning", meaning="", frequency=4),
+        WordEntry(source_index=102, word="john", meaning="", frequency=2),
+        WordEntry(source_index=103, word="translation", meaning="", frequency=1),
+    ]
+
+    indexes = LocalLlmExampleGenerator._parse_pdf_vocabulary_cleaning_response(
+        json.dumps({"remove_csv_indexes": [2]}),
+        batch,
+    )
+
+    assert indexes == {102}
+
+
+def test_pdf_vocabulary_cleaner_tolerates_non_json_response() -> None:
+    batch = [
+        WordEntry(source_index=101, word="machine learning", meaning="", frequency=4),
+        WordEntry(source_index=102, word="john", meaning="", frequency=2),
+        WordEntry(source_index=103, word="translation", meaning="", frequency=1),
+    ]
+
+    indexes = LocalLlmExampleGenerator._parse_pdf_vocabulary_cleaning_response(
+        "Remove row 2.",
+        batch,
+    )
+
+    assert indexes == {102}
+
+
+def test_llm_auto_tuning_scales_with_available_cuda_memory(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.delenv("WORDPYCKET_LLM_CONTEXT", raising=False)
+    monkeypatch.delenv("WORDPYCKET_PDF_CLEAN_BATCH", raising=False)
+    monkeypatch.delenv("WORDPYCKET_PDF_CLEAN_CHARS", raising=False)
+    monkeypatch.setattr(
+        LocalLlmExampleGenerator,
+        "_detect_accelerator",
+        classmethod(lambda cls: cls._CUDA_DEVICE),
+    )
+    monkeypatch.setattr(LocalLlmExampleGenerator, "_cuda_free_vram_mb", staticmethod(lambda: 12000))
+    monkeypatch.setattr(LocalLlmExampleGenerator, "_system_memory_mb", staticmethod(lambda: 32000))
+
+    assert LocalLlmExampleGenerator._context_size() == 16384
+    assert LocalLlmExampleGenerator._pdf_clean_batch_size() == 100
+    assert LocalLlmExampleGenerator._pdf_clean_prompt_char_budget() == 10000
+
+
+def test_pdf_vocabulary_cleaning_prompt_keeps_eponyms() -> None:
+    prompt = LocalLlmExampleGenerator._build_pdf_vocabulary_cleaning_prompt(
+        [WordEntry(source_index=1, word="fourier", meaning="", frequency=3)],
+        "英语",
+    )
+
+    assert "Keep eponyms" in prompt
+    assert "Fourier" in prompt
+
+
+def test_pdf_vocabulary_cleaning_prompt_rejects_code_and_nonwords() -> None:
+    prompt = LocalLlmExampleGenerator._build_pdf_vocabulary_cleaning_prompt(
+        [
+            WordEntry(source_index=1, word="end if", meaning="", frequency=2),
+            WordEntry(source_index=2, word="xy", meaning="", frequency=4),
+        ],
+        "英语",
+    )
+
+    assert "real learnable word" in prompt
+    assert "end if" in prompt
+    assert "xy" in prompt

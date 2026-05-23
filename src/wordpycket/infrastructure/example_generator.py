@@ -15,7 +15,7 @@ from dataclasses import dataclass
 from queue import Queue
 from pathlib import Path
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import Any
+from typing import Any, Callable
 
 from wordpycket.domain.entities import WordEntry
 
@@ -59,6 +59,11 @@ class GeneratedExample:
 class GeneratedCorrection:
     corrected_word: str
     note: str = ""
+
+
+@dataclass(frozen=True)
+class GeneratedExplanation:
+    explanation: str
 
 
 @dataclass(frozen=True)
@@ -131,6 +136,22 @@ class LocalLlmExampleGenerator:
             corrected_word=str(data["corrected_word"]),
             note=str(data.get("note", "")),
         )
+
+    def explain_entry(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExplanation:
+        llm = self._load_model(0)
+        prompt = self._build_explanation_prompt(entry, scope, language)
+        content = self._call_model(
+            llm,
+            prompt,
+            system_prompt="You explain target-language vocabulary usage for Chinese learners. Return only valid JSON.",
+        )
+        return self._parse_explanation_response(content)
+
+    def explain_entry_isolated(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExplanation:
+        if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
+            return self.explain_entry(entry, scope, language)
+        data = self._run_isolated_worker("explain", entry, scope, language)
+        return GeneratedExplanation(explanation=str(data["explanation"]))
 
     def generate_many(
         self,
@@ -231,9 +252,10 @@ class LocalLlmExampleGenerator:
         action: str,
         entry: WordEntry,
         scope: str,
+        language: str = "",
     ) -> dict[str, Any]:
         env = self.isolated_environment()
-        payload = self.isolated_payload(action, entry, scope)
+        payload = self.isolated_payload(action, entry, scope, language)
         timeout = self._isolated_timeout_seconds()
         try:
             result = subprocess.run(
@@ -265,11 +287,12 @@ class LocalLlmExampleGenerator:
         env["PYTHONPATH"] = os.pathsep.join(python_paths)
         return env
 
-    def isolated_payload(self, action: str, entry: WordEntry, scope: str) -> str:
+    def isolated_payload(self, action: str, entry: WordEntry, scope: str, language: str = "") -> str:
         payload = {
             "action": action,
             "model_dir": str(self._model_dir),
             "scope": scope,
+            "language": language,
             "entry": {
                 "word": entry.word,
                 "meaning": entry.meaning,
@@ -370,7 +393,7 @@ class LocalLlmExampleGenerator:
             device = self._select_device(llama_supports_gpu_offload())
             model_options = {
                 "model_path": str(model_path),
-                "n_ctx": 2048,
+                "n_ctx": self._context_size(model_path),
                 "n_threads": self._threads_per_model(),
                 "chat_format": "chatml",
                 "verbose": False,
@@ -669,6 +692,49 @@ class LocalLlmExampleGenerator:
     def _has_mps_device() -> bool:
         return platform.system() == "Darwin" and platform.machine() in {"arm64", "arm"}
 
+    @classmethod
+    def _context_size(cls, model_path: Path | None = None) -> int:
+        raw_value = os.getenv("WORDPYCKET_LLM_CONTEXT")
+        if raw_value is None:
+            return cls._auto_context_size(model_path)
+        try:
+            return max(2048, min(32768, int(raw_value)))
+        except ValueError as error:
+            raise RuntimeError("WORDPYCKET_LLM_CONTEXT 必须是整数。") from error
+
+    @classmethod
+    def _auto_context_size(cls, model_path: Path | None = None) -> int:
+        memory_mb = cls._system_memory_mb()
+        model_size_mb = cls._model_size_mb(model_path)
+        cpu_count = os.cpu_count() or 1
+
+        if cls._detect_accelerator() == cls._CUDA_DEVICE:
+            free_vram_mb = cls._cuda_free_vram_mb()
+            if free_vram_mb is not None:
+                budget_mb = min(memory_mb, max(0, free_vram_mb - max(1200, model_size_mb // 3)))
+                if budget_mb >= 15000:
+                    return 32768
+                if budget_mb >= 8500:
+                    return 16384
+                if budget_mb >= 4200:
+                    return 8192
+                return 4096 if budget_mb >= 2500 else 2048
+
+        if cls._has_mps_device():
+            if memory_mb >= 48000:
+                return 32768
+            if memory_mb >= 24000:
+                return 16384
+            if memory_mb >= 12000:
+                return 8192
+            return 4096
+
+        if memory_mb >= 48000 and cpu_count >= 12:
+            return 16384
+        if memory_mb >= 24000 and cpu_count >= 8:
+            return 8192
+        return 4096 if memory_mb >= 8000 else 2048
+
     @staticmethod
     def _gpu_layers() -> int:
         raw_value = os.getenv("WORDPYCKET_LLM_GPU_LAYERS")
@@ -679,15 +745,256 @@ class LocalLlmExampleGenerator:
         except ValueError as error:
             raise RuntimeError("WORDPYCKET_LLM_GPU_LAYERS 必须是整数。") from error
 
+    def clean_pdf_vocabulary_entries(
+        self,
+        entries: list[WordEntry],
+        language: str,
+        progress_callback: Callable[[str, int], None] | None = None,
+    ) -> list[WordEntry]:
+        if not entries:
+            return []
+        llm = self._load_model(0)
+        removed_indexes: set[int] = set()
+        batches = self._pdf_clean_batches(entries)
+        total_batches = len(batches)
+        for batch_index, batch in enumerate(batches, start=1):
+            if progress_callback is not None:
+                percent = 40 + int((batch_index - 1) / max(1, total_batches) * 40)
+                progress_callback(f"AI 审阅 CSV：{batch_index}/{total_batches}", percent)
+            prompt = self._build_pdf_vocabulary_cleaning_prompt(batch, language)
+            content = self._call_model(
+                llm,
+                prompt,
+                system_prompt="You review generated vocabulary CSV rows. Return only valid JSON.",
+                max_tokens=256,
+            )
+            removed_indexes.update(self._parse_pdf_vocabulary_cleaning_response(content, batch))
+            if progress_callback is not None:
+                percent = 40 + int(batch_index / max(1, total_batches) * 40)
+                progress_callback(f"AI 审阅 CSV：已完成 {batch_index}/{total_batches}", percent)
+        if progress_callback is not None:
+            progress_callback("AI 审阅 CSV 完成", 80)
+        return [
+            WordEntry(
+                id=entry.id,
+                word=entry.word,
+                meaning=entry.meaning,
+                source_index=index,
+                frequency=entry.frequency,
+                forms=entry.forms,
+                example_sentence=entry.example_sentence,
+                example_sentence_cn=entry.example_sentence_cn,
+                created_at=entry.created_at,
+                mastery_level=entry.mastery_level,
+                review_count=entry.review_count,
+                correct_count=entry.correct_count,
+                wrong_count=entry.wrong_count,
+                last_reviewed_at=entry.last_reviewed_at,
+                learned_available_at=entry.learned_available_at,
+            )
+            for index, entry in enumerate(
+                (entry for entry in entries if entry.source_index not in removed_indexes),
+                start=1,
+            )
+        ]
+
+    @classmethod
+    def _pdf_clean_batches(cls, entries: list[WordEntry]) -> list[list[WordEntry]]:
+        max_rows = cls._pdf_clean_batch_size()
+        char_budget = cls._pdf_clean_prompt_char_budget()
+        batches: list[list[WordEntry]] = []
+        current: list[WordEntry] = []
+        current_size = 0
+        for entry in entries:
+            row_size = len(json.dumps(cls._csv_review_row(entry), ensure_ascii=False, separators=(",", ":")))
+            if current and (len(current) >= max_rows or current_size + row_size > char_budget):
+                batches.append(current)
+                current = []
+                current_size = 0
+            current.append(entry)
+            current_size += row_size
+        if current:
+            batches.append(current)
+        return batches
+
     @staticmethod
-    def _call_model(llm: Any, prompt: str) -> str:
+    def _pdf_clean_batch_size() -> int:
+        raw_value = os.getenv("WORDPYCKET_PDF_CLEAN_BATCH")
+        if raw_value is None:
+            return LocalLlmExampleGenerator._auto_pdf_clean_batch_size()
+        try:
+            return max(10, min(100, int(raw_value)))
+        except ValueError as error:
+            raise RuntimeError("WORDPYCKET_PDF_CLEAN_BATCH 必须是整数。") from error
+
+    @staticmethod
+    def _pdf_clean_prompt_char_budget() -> int:
+        raw_value = os.getenv("WORDPYCKET_PDF_CLEAN_CHARS")
+        if raw_value is None:
+            return LocalLlmExampleGenerator._auto_pdf_clean_prompt_char_budget()
+        try:
+            return max(1000, min(12000, int(raw_value)))
+        except ValueError as error:
+            raise RuntimeError("WORDPYCKET_PDF_CLEAN_CHARS 必须是整数。") from error
+
+    @classmethod
+    def _auto_pdf_clean_batch_size(cls) -> int:
+        context = cls._context_size()
+        memory_mb = cls._system_memory_mb()
+        cpu_count = os.cpu_count() or 1
+        if context >= 16384:
+            rows = 100
+        elif context >= 8192:
+            rows = 80
+        elif context >= 4096:
+            rows = 50
+        else:
+            rows = 25
+        if memory_mb < 6000:
+            rows = min(rows, 25)
+        elif memory_mb < 10000:
+            rows = min(rows, 40)
+        if cpu_count <= 4:
+            rows = min(rows, 35)
+        return max(10, min(100, rows))
+
+    @classmethod
+    def _auto_pdf_clean_prompt_char_budget(cls) -> int:
+        context = cls._context_size()
+        if context >= 32768:
+            budget = 12000
+        elif context >= 16384:
+            budget = 10000
+        elif context >= 8192:
+            budget = 7500
+        elif context >= 4096:
+            budget = 4500
+        else:
+            budget = 2500
+        if cls._system_memory_mb() < 6000:
+            budget = min(budget, 2500)
+        return max(1000, min(12000, budget))
+
+    @staticmethod
+    def _csv_review_row(entry: WordEntry) -> list[int | str]:
+        return [
+            entry.source_index,
+            LocalLlmExampleGenerator._truncate_for_prompt(entry.word, 80),
+            entry.frequency,
+            LocalLlmExampleGenerator._truncate_for_prompt(entry.forms, 80),
+        ]
+
+    @staticmethod
+    def _truncate_for_prompt(value: str, limit: int) -> str:
+        if len(value) <= limit:
+            return value
+        return f"{value[:limit]}..."
+
+    @staticmethod
+    def _build_pdf_vocabulary_cleaning_prompt(entries: list[WordEntry], language: str) -> str:
+        rows = [LocalLlmExampleGenerator._csv_review_row(entry) for entry in entries]
+        return (
+            "You are reviewing a rough vocabulary CSV generated from PDF text.\n"
+            f"Detected language: {language}\n"
+            "Rows are arrays: [csv_index, term, frequency, forms].\n"
+            "For each row, decide whether term is a real learnable word or meaningful terminology phrase.\n"
+            "Remove rows that are not learnable vocabulary terms, including:\n"
+            "- programming keywords or code/control-flow fragments such as if, else, endif, end if, return, for, while;\n"
+            "- variable/function identifiers, library names, filenames, URLs, emails, or code fragments;\n"
+            "- letter noise, OCR fragments, or non-words such as xy, abc, tmp, idx, foo, bar when they are not established terms;\n"
+            "- full person names, author-list names, organization names, venue names, or bibliography artifacts;\n"
+            "- page/header/footer artifacts, citation markers, broken fragments, or table labels.\n"
+            "Keep rows that are real words, academic terms, domain terms, abbreviations with established meaning, "
+            "or meaningful fixed phrases, even if they are rare.\n"
+            "Keep eponyms and name-derived technical terms when they are used as concepts, methods, or adjectives, "
+            "such as Fourier, Gaussian, Bayesian, Newtonian, Eulerian, Markov, Laplace, Hamiltonian, or Turing.\n"
+            "Delete a name-derived term only when it is clearly just an author/person entry or bibliography residue.\n"
+            "Review only these CSV rows. Do not infer from the original PDF. "
+            "You will receive at most 100 rows in this batch. "
+            "Return only the csv_index values from the first column. Do not return batch row numbers. "
+            "Do not include reasons or explanations.\n"
+            "Return JSON only, exactly like: {\"remove_csv_indexes\": [101, 102]}\n"
+            f"CSV rows:\n{json.dumps(rows, ensure_ascii=False, separators=(',', ':'))}"
+        )
+
+    @staticmethod
+    def _parse_pdf_vocabulary_cleaning_response(content: str, batch: list[WordEntry]) -> set[int]:
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
+            cleaned = re.sub(r"```$", "", cleaned).strip()
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if match:
+            cleaned = match.group(0)
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError:
+            return LocalLlmExampleGenerator._parse_pdf_cleaning_numbers(content, batch)
+        if isinstance(data, list):
+            data = {"remove_csv_indexes": data}
+        if not isinstance(data, dict):
+            return set()
+
+        valid_indexes = {entry.source_index for entry in batch}
+        indexes: set[int] = set()
+        raw_indexes = data.get(
+            "remove_csv_indexes",
+            data.get("remove_source_indexes", data.get("remove", [])),
+        )
+        if isinstance(raw_indexes, list):
+            for value in raw_indexes:
+                index = LocalLlmExampleGenerator._coerce_pdf_clean_index(value, batch, valid_indexes)
+                if index is not None:
+                    indexes.add(index)
+
+        raw_words = data.get("remove_words", [])
+        if isinstance(raw_words, list):
+            words = {str(word).strip().lower() for word in raw_words}
+            indexes.update(
+                entry.source_index
+                for entry in batch
+                if entry.word.lower() in words
+            )
+        return indexes
+
+    @staticmethod
+    def _parse_pdf_cleaning_numbers(content: str, batch: list[WordEntry]) -> set[int]:
+        valid_indexes = {entry.source_index for entry in batch}
+        indexes: set[int] = set()
+        for value in re.findall(r"\b\d+\b", content):
+            index = LocalLlmExampleGenerator._coerce_pdf_clean_index(value, batch, valid_indexes)
+            if index is not None:
+                indexes.add(index)
+        return indexes
+
+    @staticmethod
+    def _coerce_pdf_clean_index(
+        value: Any,
+        batch: list[WordEntry],
+        valid_indexes: set[int],
+    ) -> int | None:
+        try:
+            index = int(value)
+        except (TypeError, ValueError):
+            return None
+        if index in valid_indexes:
+            return index
+        if 1 <= index <= len(batch):
+            return batch[index - 1].source_index
+        return None
+
+    @staticmethod
+    def _call_model(
+        llm: Any,
+        prompt: str,
+        system_prompt: str | None = None,
+        max_tokens: int = 200,
+    ) -> str:
         messages = [
             {
                 "role": "system",
-                "content": (
-                    "You generate concise English vocabulary examples. "
-                    "Return only valid JSON."
-                ),
+                "content": system_prompt
+                or "You generate concise English vocabulary examples. Return only valid JSON.",
             },
             {"role": "user", "content": prompt},
         ]
@@ -695,15 +1002,15 @@ class LocalLlmExampleGenerator:
             response = llm.create_chat_completion(
                 messages=messages,
                 temperature=0.4,
-                max_tokens=200,
+                max_tokens=max_tokens,
                 response_format={"type": "json_object"},
             )
             return LocalLlmExampleGenerator._extract_chat_content(response)
         except (KeyError, TypeError, ValueError, AttributeError):
             response = llm.create_completion(
-                prompt=LocalLlmExampleGenerator._build_completion_prompt(prompt),
+                prompt=LocalLlmExampleGenerator._build_completion_prompt(prompt, system_prompt),
                 temperature=0.4,
-                max_tokens=200,
+                max_tokens=max_tokens,
                 stop=["\n\n"],
             )
             return LocalLlmExampleGenerator._extract_completion_text(response)
@@ -761,10 +1068,9 @@ class LocalLlmExampleGenerator:
         return str(response["choices"][0]["text"])
 
     @staticmethod
-    def _build_completion_prompt(prompt: str) -> str:
+    def _build_completion_prompt(prompt: str, system_prompt: str | None = None) -> str:
         return (
-            "You generate concise English vocabulary examples. "
-            "Return only valid JSON.\n\n"
+            f"{system_prompt or 'You generate concise English vocabulary examples. Return only valid JSON.'}\n\n"
             f"{prompt}\n\nJSON:"
         )
 
@@ -891,6 +1197,30 @@ class LocalLlmExampleGenerator:
         )
 
     @staticmethod
+    def _build_explanation_prompt(entry: WordEntry, scope: str = "", language: str = "") -> str:
+        scope_text = LocalLlmExampleGenerator._build_scope_text(scope)
+        language_text = language.strip() or "Infer from the word or phrase and the vocabulary table."
+        return (
+            "Explain the target-language usage of this vocabulary item for a Chinese learner.\n"
+            f"Target vocabulary language: {language_text}\n"
+            f"{scope_text}"
+            f"Word or phrase: {entry.word}\n"
+            f"Chinese meaning in the app, for reference only: {entry.meaning or '(empty)'}\n"
+            f"Word forms: {entry.forms or '(empty)'}\n"
+            f"Example sentence: {entry.example_sentence or '(empty)'}\n"
+            f"Example Chinese translation: {entry.example_sentence_cn or '(empty)'}\n"
+            "Requirements:\n"
+            "- Write in Simplified Chinese.\n"
+            "- Keep it concise but useful.\n"
+            "- Explain how the word or phrase is used in its target language: core sense, grammar role, common collocations, register, and nuance.\n"
+            "- If an example sentence is provided, explain the target-language usage in that sentence.\n"
+            "- Do not explain how the Chinese translation is used in Chinese.\n"
+            "- Do not treat the Chinese meaning as the target word; it is only a reference to disambiguate the vocabulary item.\n"
+            "- Do not invent a different headword.\n"
+            'Return JSON exactly like: {"explanation": "..."}'
+        )
+
+    @staticmethod
     def _build_scope_text(scope: str) -> str:
         cleaned = scope.strip()
         if not cleaned:
@@ -970,6 +1300,27 @@ class LocalLlmExampleGenerator:
             note=note,
         )
 
+    @staticmethod
+    def _parse_explanation_response(content: str) -> GeneratedExplanation:
+        cleaned = content.strip()
+        if cleaned.startswith("```"):
+            cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
+            cleaned = re.sub(r"```$", "", cleaned).strip()
+
+        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
+        if match:
+            cleaned = match.group(0)
+
+        try:
+            data = json.loads(cleaned)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"模型返回内容不是有效 JSON：{content}") from error
+
+        explanation = str(data.get("explanation", "")).strip()
+        if not explanation:
+            raise RuntimeError(f"模型返回缺少解释字段：{content}")
+        return GeneratedExplanation(explanation=explanation)
+
 
 def _main() -> None:
     payload = json.loads(sys.stdin.read())
@@ -986,6 +1337,7 @@ def _main() -> None:
     generator = LocalLlmExampleGenerator(Path(payload["model_dir"]))
     action = payload["action"]
     scope = str(payload.get("scope", ""))
+    language = str(payload.get("language", ""))
     if action == "generate":
         generated = generator.generate(entry, scope)
         result = {
@@ -1000,6 +1352,9 @@ def _main() -> None:
             "corrected_word": corrected.corrected_word,
             "note": corrected.note,
         }
+    elif action == "explain":
+        explained = generator.explain_entry(entry, scope, language)
+        result = {"explanation": explained.explanation}
     elif action == "smoke_test":
         generator._run_smoke_test()
         result = {"ok": True}
