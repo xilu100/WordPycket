@@ -47,6 +47,8 @@ def main() -> None:
 
     library = CsvLibrary(input_dir, database_dir)
     active_csv = library.active_csv()
+    if active_csv is None:
+        library.cleanup_orphan_databases()
     initial_database = library.database_path(active_csv) if active_csv is not None else database_dir / "empty.db"
     repository = SqliteWordRepository(initial_database)
     service = WordService(repository)
@@ -87,8 +89,6 @@ def main() -> None:
 
     if active_csv is not None:
         activate_csv(active_csv)
-    else:
-        library.cleanup_orphan_databases()
 
     app = WordPycketApp(
         service,
