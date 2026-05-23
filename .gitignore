@@ -19,12 +19,28 @@ runtime/
 build/
 dist/
 *.egg-info/
+*.spec
+*.zip
+*.7z
+*.tar
+*.tar.gz
+*.tmp
+*.bak
 
 # IDE/editor files
 .idea/
 .vscode/
 *.swp
 *.swo
+
+# Logs
+*.log
+logs/
+
+# Environment / local config
+.env
+.env.*
+!.env.example
 
 # Local application data
 *.db
@@ -42,5 +58,12 @@ data/
 # OS files
 .DS_Store
 Thumbs.db
+.AppleDouble
+.LSOverride
+._*
+
+# Windows shortcuts / local launch artifacts
+*.lnk
+
 # LLM
 model/
