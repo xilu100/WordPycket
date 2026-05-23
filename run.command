@@ -7,7 +7,7 @@ UV_DIR="$RUNTIME_DIR/uv"
 UV_EXE="$UV_DIR/uv"
 UV_ARCHIVE="$RUNTIME_DIR/uv.tar.gz"
 PYTHON_INSTALL_DIR="$RUNTIME_DIR/python"
-PYTHON_VERSION="3.12"
+PYTHON_VERSION="3.11"
 VENV_PATH="$ROOT/.venv"
 VENV_PYTHON="$VENV_PATH/bin/python"
 SETUP_MARKER="$RUNTIME_DIR/.setup-complete"
@@ -54,10 +54,25 @@ install_local_python() {
     "$UV_EXE" python install "$PYTHON_VERSION"
 }
 
+get_venv_python_version() {
+    if [ ! -x "$VENV_PYTHON" ]; then
+        return 1
+    fi
+    "$VENV_PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
+}
+
 install_local_uv
 install_local_python
 
 needs_setup=0
+existing_python_version="$(get_venv_python_version || true)"
+if [ -n "$existing_python_version" ] && [ "$existing_python_version" != "$PYTHON_VERSION" ]; then
+    echo "Existing virtual environment uses Python $existing_python_version; recreating with Python $PYTHON_VERSION."
+    rm -rf "$VENV_PATH"
+    rm -f "$SETUP_MARKER"
+    needs_setup=1
+fi
+
 if [ ! -x "$VENV_PYTHON" ]; then
     "$UV_EXE" venv --seed --python "$PYTHON_VERSION" "$VENV_PATH"
     needs_setup=1
