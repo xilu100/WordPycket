@@ -35,7 +35,8 @@ def main() -> int:
 
     run([str(python), "-m", "pip", "install", "--upgrade", "pip", "setuptools", "wheel"])
     install_base_dependencies(python)
-    install_llama_cpp(python, select_device(args.device), args.strict_accel)
+    device = select_device(args.device)
+    install_llama_cpp(python, device, args.strict_accel or device == "cuda")
     install_nltk_data(python)
     install_spacy_models(python, args.spacy_models)
     install_project(python)
@@ -145,7 +146,7 @@ def has_cuda_device() -> bool:
 
 def cuda_wheel_tags() -> list[str]:
     detected = detected_cuda_version()
-    supported = ["cu129", "cu128", "cu126", "cu125", "cu124", "cu123", "cu122", "cu121", "cu120"]
+    supported = ["cu124", "cu123", "cu122", "cu121", "cu120"]
     if detected is None:
         return supported
     major, minor = detected

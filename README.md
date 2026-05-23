@@ -20,7 +20,7 @@ run.exe
 run.bat
 ```
 
-`run.bat` 不会寻找或使用电脑上已有的 Python。它会先在项目目录内下载 `uv.exe`，再把完整 Python 安装到 `runtime/python/`，然后创建 `.venv/`、`model/` 和 `data/`，并自动配置环境后启动。
+`run.bat` 不会寻找或使用电脑上已有的 Python。它会先在项目目录内下载 `uv.exe`，再把完整 Python 3.11 安装到 `runtime/python/`，然后创建 `.venv/`、`model/` 和 `data/`，并自动配置环境后启动。检测到 NVIDIA 显卡时会要求安装 CUDA 版 `llama-cpp-python`；CUDA 版装不上会停止并显示错误，避免悄悄退到 CPU 版。
 
 ### macOS
 
@@ -117,7 +117,7 @@ data/
 python scripts/setup_env.py
 ```
 
-脚本会自动检测 NVIDIA CUDA、macOS Apple Metal/MPS 和 CPU，并优先安装 `llama-cpp-python` 的预编译 CUDA/Metal wheel。没有可用 GPU/驱动，或没有匹配 wheel 时会使用 CPU；项目不能在没有 NVIDIA GPU 和驱动的机器上凭空提供可用 CUDA。
+脚本会自动检测 NVIDIA CUDA、macOS Apple Metal/MPS 和 CPU。检测到 NVIDIA 显卡时会安装 `llama-cpp-python` 的预编译 CUDA wheel；没有匹配 wheel 时会停止并报错，避免把有 NVIDIA 的机器配置成 CPU 版。没有可用 GPU/驱动时才会使用 CPU；项目不能在没有 NVIDIA GPU 和驱动的机器上凭空提供可用 CUDA。
 
 只安装部分 spaCy 模型可用：
 

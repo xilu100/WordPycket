@@ -7,7 +7,7 @@ $UvExe = Join-Path $UvDir "uv.exe"
 $UvZip = Join-Path $RuntimeDir "uv.zip"
 $UvUrl = "https://github.com/astral-sh/uv/releases/latest/download/uv-x86_64-pc-windows-msvc.zip"
 $PythonInstallDir = Join-Path $RuntimeDir "python"
-$PythonVersion = "3.12"
+$PythonVersion = "3.11"
 $VenvPath = Join-Path $Root ".venv"
 $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
 $SetupMarker = Join-Path $RuntimeDir ".setup-complete"
@@ -45,17 +45,32 @@ function Install-LocalPython {
     & $UvExe python install $PythonVersion
 }
 
+function Get-VenvPythonVersion {
+    if (-not (Test-Path $VenvPython)) {
+        return $null
+    }
+    return (& $VenvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
+}
+
 Install-LocalUv
 Install-LocalPython
 
 $NeedsSetup = -not (Test-Path $SetupMarker)
+$ExistingPythonVersion = Get-VenvPythonVersion
+if (($null -ne $ExistingPythonVersion) -and ($ExistingPythonVersion -ne $PythonVersion)) {
+    Write-Host "Existing virtual environment uses Python $ExistingPythonVersion; recreating with Python $PythonVersion."
+    Remove-Item -Recurse -Force $VenvPath
+    Remove-Item -Force -ErrorAction SilentlyContinue $SetupMarker
+    $NeedsSetup = $true
+}
+
 if (-not (Test-Path $VenvPython)) {
     & $UvExe venv --seed --python $PythonVersion $VenvPath
     $NeedsSetup = $true
 }
 
 if ($NeedsSetup) {
-    & $VenvPython (Join-Path $Root "scripts\setup_env.py")
+    & $VenvPython (Join-Path $Root "scripts\setup_env.py") --strict-accel
     New-Item -ItemType File -Force -Path $SetupMarker | Out-Null
 }
 
