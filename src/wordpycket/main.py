@@ -7,7 +7,7 @@ from wordpycket.application.services import WordService
 from wordpycket.infrastructure.csv_importer import WordFrequencyCsvImporter
 from wordpycket.infrastructure.csv_library import CsvLibrary
 from wordpycket.infrastructure.example_generator import LocalLlmExampleGenerator
-from wordpycket.infrastructure.pdf_vocabulary_importer import PdfVocabularyImporter
+from wordpycket.infrastructure.pdf_vocabulary_importer import run_pdf_import_isolated
 from wordpycket.infrastructure.repositories import SqliteWordRepository
 from wordpycket.infrastructure.settings_store import JsonSettingsStore
 from wordpycket.presentation.qt_app import WordPycketApp
@@ -52,12 +52,7 @@ def main() -> None:
         library,
         repository_factory=SqliteWordRepository,
         csv_loader=lambda path: WordFrequencyCsvImporter(path).load_with_metadata(),
-        pdf_builder=lambda pdf_path, csv_path, cleaner, progress: PdfVocabularyImporter(
-            pdf_path,
-            csv_path,
-            vocabulary_cleaner=cleaner,
-            progress_callback=progress,
-        ).build(),
+        pdf_builder=run_pdf_import_isolated,
         empty_database_path=database_dir / "__empty__.db",
         vocabulary_cleaner=example_generator,
     )

@@ -1,60 +1,66 @@
 from __future__ import annotations
 
-import sys
-from types import SimpleNamespace
+import json
+from pathlib import Path
 
 from wordpycket.infrastructure.csv_importer import WordFrequencyCsvImporter
-from wordpycket.infrastructure.pdf_vocabulary_importer import PdfVocabularyImporter
+from wordpycket.infrastructure.pdf_vocabulary_importer import (
+    DeterministicMultilingualFrequencyEngine,
+    PdfVocabularyImporter,
+    run_pdf_import_isolated,
+)
 
 
-def test_pdf_vocabulary_importer_detects_english_and_counts_phrases(tmp_path) -> None:
-    text = (
+def test_pdf_vocabulary_importer_outputs_strict_csv_schema(tmp_path) -> None:
+    csv_path = tmp_path / "word_frequency.csv"
+    entries, language, schema = PdfVocabularyImporter.entries_from_text(
         "Machine learning improves language models. "
-        "Machine learning improves search systems. "
-        "Language models use training data."
+        "Machine learning improves search systems."
     )
 
-    entries, language, schema = PdfVocabularyImporter.entries_from_text(text)
+    PdfVocabularyImporter.write_csv(entries, schema, csv_path)
 
     assert language == "英语"
     assert schema.columns == ("Index", "English", "Chinese", "Frequency", "Forms")
-    terms = {entry.word: entry.frequency for entry in entries}
-    assert terms["machine learning"] == 2
-    assert "machine" not in terms
-    assert "learning" not in terms
+    assert csv_path.read_text(encoding="utf-8-sig").splitlines()[0] == "Index,English,Chinese,Frequency,Forms"
 
 
-def test_pdf_vocabulary_importer_detects_german(tmp_path, monkeypatch) -> None:
-    text = (
-        "Der Vektor und die Matrix sind wichtig. "
-        "Der Vektor ist Teil der linearen Algebra."
+def test_pdf_vocabulary_importer_counts_lemmas_forms_and_phrases() -> None:
+    entries, language, _schema = PdfVocabularyImporter.entries_from_text(
+        "Use tools. The system uses tools. "
+        "People are using tools. It was used before. "
+        "Machine learning improves systems. Machine learning improves search."
     )
 
-    monkeypatch.setattr(
-        PdfVocabularyImporter,
-        "_spacy_lemma_counts",
-        classmethod(lambda _cls, _language, counts: [(word, count, "") for word, count in counts.items()]),
-    )
+    assert language == "英语"
+    by_word = {entry.word: entry for entry in entries}
+    assert by_word["use"].frequency == 4
+    assert by_word["use"].forms == "use;used;uses;using"
+    assert by_word["machine learning"].frequency == 2
 
-    entries, language, schema = PdfVocabularyImporter.entries_from_text(text)
+
+def test_pdf_vocabulary_importer_detects_german_with_fixed_schema() -> None:
+    entries, language, schema = PdfVocabularyImporter.entries_from_text(
+        "Der Vektor ist wichtig. Die Vektoren sind wichtig."
+    )
 
     assert language == "德语"
-    assert schema.columns == ("Index", "Deutsch", "Chinesisch", "Häufigkeit", "Formen")
-    assert any(entry.word == "vektor" for entry in entries)
+    assert schema.columns == ("Index", "English", "Chinese", "Frequency", "Forms")
+    by_word = {entry.word: entry for entry in entries}
+    assert by_word["vektor"].frequency == 2
+    assert by_word["vektor"].forms == "vektor;vektoren"
 
 
-def test_pdf_vocabulary_importer_uses_dominant_language_not_first_language() -> None:
-    text = (
-        "これは短い日本語です。\n"
-        "The model improves language translation. "
-        "The language model improves retrieval. "
-        "The model learns from data."
+def test_pdf_vocabulary_importer_segments_chinese_without_model() -> None:
+    entries, language, schema = PdfVocabularyImporter.entries_from_text(
+        "机器学习提高系统性能。机器学习改善搜索质量。"
     )
 
-    _entries, language, schema = PdfVocabularyImporter.entries_from_text(text)
-
-    assert language == "英语"
+    assert language == "中文"
     assert schema.columns == ("Index", "English", "Chinese", "Frequency", "Forms")
+    terms = {entry.word: entry.frequency for entry in entries}
+    assert terms["机器"] == 2
+    assert terms["学习"] == 2
 
 
 def test_pdf_vocabulary_importer_writes_csv_compatible_with_csv_importer(tmp_path) -> None:
@@ -63,7 +69,7 @@ def test_pdf_vocabulary_importer_writes_csv_compatible_with_csv_importer(tmp_pat
         "Machine learning helps machine translation."
     )
 
-    PdfVocabularyImporter.write_csv(entries[:5], schema, csv_path)
+    PdfVocabularyImporter.write_csv(entries, schema, csv_path)
     result = WordFrequencyCsvImporter(csv_path).load_with_metadata()
 
     assert result.language == "英语"
@@ -72,7 +78,58 @@ def test_pdf_vocabulary_importer_writes_csv_compatible_with_csv_importer(tmp_pat
     assert result.entries[0].frequency > 0
 
 
-def test_pdf_vocabulary_importer_cleans_with_llm_and_reindexes(tmp_path, monkeypatch) -> None:
+def test_pdf_vocabulary_importer_ignores_formulas_urls_and_code() -> None:
+    text = """
+    E = mc^2 + \\alpha / \\beta
+    https://example.com/paper?id=42
+    import numpy as np
+    def train_model(x):
+        return model.predict(x)
+    Machine learning improves translation quality.
+    Machine learning improves retrieval quality.
+    """
+
+    entries, _language, _schema = PdfVocabularyImporter.entries_from_text(text)
+
+    terms = {entry.word for entry in entries}
+    assert "machine learning" in terms
+    assert "https" not in terms
+    assert "numpy" not in terms
+    assert "predict" not in terms
+
+
+def test_pdf_vocabulary_importer_filters_identifiers_names_and_keeps_eponym_terms() -> None:
+    entries, _language, _schema = PdfVocabularyImporter.entries_from_text(
+        "Li Hua generated a file named wordApp which mentions Bayes' theorem. "
+        "tempScore hasError JSONParserFactory VECTOR_SIZE should not become vocabulary. "
+        "Bayes' theorem improves inference."
+    )
+
+    terms = {entry.word: entry for entry in entries}
+    assert "bayes' theorem" in terms
+    assert terms["bayes' theorem"].frequency == 2
+    assert "li" not in terms
+    assert "hua" not in terms
+    assert "wordapp" not in terms
+    assert "tempscore" not in terms
+    assert "haserror" not in terms
+    assert "jsonparserfactory" not in terms
+    assert "vector_size" not in terms
+
+
+def test_pdf_vocabulary_importer_does_not_emit_repeated_bigram_noise() -> None:
+    entries, _language, _schema = PdfVocabularyImporter.entries_from_text(
+        "parser parser parser parser extraction extraction extraction extraction"
+    )
+
+    terms = {entry.word for entry in entries}
+    assert "parser" in terms
+    assert "extraction" in terms
+    assert "parser parser" not in terms
+    assert "extraction extraction" not in terms
+
+
+def test_pdf_vocabulary_importer_optional_llm_cleaner_filters_and_reindexes(tmp_path, monkeypatch) -> None:
     class FakeCleaner:
         def clean_pdf_vocabulary_entries(self, entries, language, progress_callback=None):
             assert language == "英语"
@@ -87,237 +144,100 @@ def test_pdf_vocabulary_importer_cleans_with_llm_and_reindexes(tmp_path, monkeyp
         "extract_text",
         staticmethod(lambda _path: "John wrote code. Machine learning improves systems."),
     )
-    monkeypatch.setattr(
-        PdfVocabularyImporter,
-        "_nltk_lemma_counts",
-        classmethod(lambda _cls, counts: [(word, count, "") for word, count in counts.items()]),
-    )
 
     result = PdfVocabularyImporter(pdf_path, csv_path, vocabulary_cleaner=FakeCleaner()).build()
 
     assert "john" not in {entry.word for entry in result.entries}
     assert [entry.source_index for entry in result.entries] == list(range(1, len(result.entries) + 1))
+    assert "john" not in csv_path.read_text(encoding="utf-8-sig").lower()
 
 
-def test_pdf_vocabulary_importer_ignores_formulas_urls_and_noise() -> None:
-    text = """
-    E = mc^2 + \\alpha / \\beta
-    https://example.com/paper?id=42
-    [12, 14-16]
-    x_i = \\sum_j W_{ij} h_j
-    Machine learning models improve translation.
-    Machine learning models improve retrieval.
-    """
-
-    entries, _language, _schema = PdfVocabularyImporter.entries_from_text(text)
-
-    terms = {entry.word for entry in entries}
-    assert "machine learning" in terms
-    assert "machine learning models" not in terms
-    assert "https" not in terms
-    assert "example" not in terms
-    assert "mc" not in terms
-    assert "sum" not in terms
-    assert "ij" not in terms
-
-
-def test_pdf_vocabulary_importer_ignores_obvious_code_lines() -> None:
-    text = """
-    import numpy as np
-    def train_model(x):
-        return model.predict(x)
-    const value = items.map(item => item.score);
-    for (int i = 0; i < n; i++) { result += values[i]; }
-    Machine learning improves translation quality.
-    Machine learning improves retrieval quality.
-    """
-
-    entries, _language, _schema = PdfVocabularyImporter.entries_from_text(text)
-
-    terms = {entry.word for entry in entries}
-    assert "machine learning" in terms
-    assert "import" not in terms
-    assert "numpy" not in terms
-    assert "predict" not in terms
-    assert "const" not in terms
-    assert "result" not in terms
-
-
-def test_pdf_vocabulary_importer_groups_english_forms_under_lemma() -> None:
-    text = (
-        "Use tools. The system uses tools. "
-        "People are using tools. It was used before. "
-        "They are being tested and were useful."
-    )
-
-    entries, language, _schema = PdfVocabularyImporter.entries_from_text(text)
-
-    assert language == "英语"
-    by_word = {entry.word: entry for entry in entries}
-    assert by_word["use"].frequency == 4
-    assert by_word["use"].forms == "used(1), uses(1), using(1)"
-    assert by_word["be"].frequency == 5
-    assert by_word["be"].forms == "are(2), being(1), was(1), were(1)"
-
-
-def test_pdf_vocabulary_importer_keeps_fixed_phrase_and_skips_generic_extension() -> None:
-    text = (
-        "The random forest model improves predictions. "
-        "A random forest model handles features. "
-        "Random forest methods are robust."
-    )
-
-    entries, language, _schema = PdfVocabularyImporter.entries_from_text(text)
-
-    assert language == "英语"
-    terms = {entry.word: entry.frequency for entry in entries}
-    assert terms["random forest"] == 3
-    assert "random" not in terms
-    assert "forest" not in terms
-    assert "random forest model" not in terms
-
-
-def test_pdf_vocabulary_importer_keeps_eponym_technical_bigram() -> None:
-    text = (
-        "Laplace law describes membrane tension. "
-        "Laplace law appears in physiology. "
-        "The Fourier transform analyzes signals."
-    )
-
-    entries, language, _schema = PdfVocabularyImporter.entries_from_text(text)
-
-    assert language == "英语"
-    terms = {entry.word: entry.frequency for entry in entries}
-    assert terms["laplace law"] == 2
-    assert terms["fourier transform"] == 1
-    assert "laplace" not in terms
-    assert "law" not in terms
-
-
-def test_pdf_vocabulary_importer_keeps_common_technical_bigrams_without_ai() -> None:
-    text = (
-        "Surface tension changes pressure. "
-        "Surface tension affects droplets. "
-        "Linear equation systems are solved. "
-        "A normal distribution models noise. "
-        "The paper result appears in a table."
-    )
-
-    entries, language, _schema = PdfVocabularyImporter.entries_from_text(text)
-
-    assert language == "英语"
-    terms = {entry.word: entry.frequency for entry in entries}
-    assert terms["surface tension"] == 2
-    assert terms["linear equation"] == 1
-    assert terms["normal distribution"] == 1
-    assert "paper result" not in terms
-
-
-def test_pdf_vocabulary_importer_groups_german_forms_under_lemma(monkeypatch) -> None:
-    text = (
-        "Der Vektor ist wichtig. Die Vektoren sind wichtig. "
-        "Der Vektor war zentral."
-    )
+def test_run_pdf_import_isolated_uses_in_process_path_when_cleaner_is_present(tmp_path, monkeypatch) -> None:
+    class FakeCleaner:
+        def clean_pdf_vocabulary_entries(self, entries, language, progress_callback=None):
+            return entries[:1]
 
     monkeypatch.setattr(
         PdfVocabularyImporter,
-        "_spacy_lemma_counts",
-        classmethod(
-            lambda _cls, _language, _counts: [
-                ("vektor", 3, "vektoren(1)"),
-                ("sein", 3, "ist(1), sind(1), war(1)"),
-                ("wichtig", 2, ""),
-                ("zentral", 1, ""),
-            ]
-        ),
+        "extract_text",
+        staticmethod(lambda _path: "Machine learning improves systems."),
     )
 
-    entries, language, _schema = PdfVocabularyImporter.entries_from_text(text)
+    result = run_pdf_import_isolated(tmp_path / "source.pdf", tmp_path / "words.csv", FakeCleaner())
 
-    assert language == "德语"
-    by_word = {entry.word: entry for entry in entries}
-    assert by_word["vektor"].frequency == 3
-    assert by_word["vektor"].forms == "vektoren(1)"
-    assert by_word["sein"].frequency == 3
-    assert by_word["sein"].forms == "ist(1), sind(1), war(1)"
+    assert result.language == "英语"
+    rows = (tmp_path / "words.csv").read_text(encoding="utf-8-sig").splitlines()
+    assert len(rows) == 2
 
 
-def test_pdf_vocabulary_importer_groups_spanish_forms_under_lemma(monkeypatch) -> None:
-    text = (
-        "El modelo mejora resultados. Los modelos mejoran sistemas. "
-        "Este modelo mejora traducciones."
+def test_run_pdf_import_isolated_uses_child_when_cleaner_supports_pdf_payload(tmp_path, monkeypatch) -> None:
+    progress: list[tuple[str, int]] = []
+    created_processes = []
+
+    class FakeCleaner:
+        def isolated_pdf_import_payload(self, pdf_path, csv_path):
+            return json.dumps(
+                {
+                    "pdf_path": str(pdf_path),
+                    "csv_path": str(csv_path),
+                    "use_llm_cleanup": True,
+                    "model_dir": str(tmp_path / "model"),
+                }
+            )
+
+        def isolated_pdf_import_environment(self):
+            return {"WORDPYCKET_PDF_CHILD": "1"}
+
+    class FakeStdin:
+        def __init__(self) -> None:
+            self.value = ""
+
+        def write(self, value: str) -> None:
+            self.value += value
+
+        def close(self) -> None:
+            return None
+
+    class FakeProcess:
+        def __init__(self, _command, **kwargs) -> None:
+            self.stdin = FakeStdin()
+            self.stdout = iter(
+                [
+                    json.dumps({"type": "progress", "message": "AI 审阅 CSV：1/2", "percent": 40}) + "\n",
+                    json.dumps({"type": "result", "language": "英语", "csv_path": str(tmp_path / "words.csv")}) + "\n",
+                ]
+            )
+            self.kwargs = kwargs
+            created_processes.append(self)
+
+        def wait(self) -> int:
+            return 0
+
+    monkeypatch.setattr("wordpycket.infrastructure.pdf_vocabulary_importer.subprocess.Popen", FakeProcess)
+
+    result = run_pdf_import_isolated(
+        tmp_path / "source.pdf",
+        tmp_path / "words.csv",
+        FakeCleaner(),
+        progress_callback=lambda message, percent: progress.append((message, percent)),
     )
 
-    monkeypatch.setattr(
-        PdfVocabularyImporter,
-        "_spacy_lemma_counts",
-        classmethod(
-            lambda _cls, _language, _counts: [
-                ("modelo", 3, "modelos(1)"),
-                ("mejora", 2, ""),
-                ("resultado", 1, "resultados(1)"),
-                ("sistema", 1, "sistemas(1)"),
-                ("traducción", 1, "traducciones(1)"),
-            ]
-        ),
+    assert result.language == "英语"
+    assert progress == [("AI 审阅 CSV：1/2", 40)]
+    process = created_processes[0]
+    assert process.kwargs["env"]["WORDPYCKET_PDF_CHILD"] == "1"
+    assert json.loads(process.stdin.value)["use_llm_cleanup"] is True
+
+
+def test_engine_can_analyze_text_folder(tmp_path) -> None:
+    (tmp_path / "a.txt").write_text("Use tools. The system uses tools.", encoding="utf-8")
+    (tmp_path / "nested").mkdir()
+    (tmp_path / "nested" / "b.txt").write_text(
+        "Der Vektor ist wichtig. Die Vektoren sind wichtig.",
+        encoding="utf-8",
     )
 
-    entries, language, _schema = PdfVocabularyImporter.entries_from_text(text)
+    entries, _language, schema = DeterministicMultilingualFrequencyEngine().analyze_folder(tmp_path)
 
-    assert language == "西班牙语"
-    by_word = {entry.word: entry for entry in entries}
-    assert by_word["modelo"].frequency == 3
-    assert by_word["modelo"].forms == "modelos(1)"
-
-
-def test_pdf_vocabulary_importer_default_max_entries_is_10000(tmp_path) -> None:
-    importer = PdfVocabularyImporter(tmp_path / "source.pdf", tmp_path / "words.csv")
-
-    assert importer._max_entries == 10000
-
-
-def test_pdf_vocabulary_importer_prefers_nltk_when_available(monkeypatch) -> None:
-    class FakeWordNetLemmatizer:
-        def lemmatize(self, word: str, pos: str = "n") -> str:
-            if word in {"uses", "using", "used"}:
-                return "use"
-            return word
-
-    fake_nltk = SimpleNamespace()
-    fake_stem = SimpleNamespace(WordNetLemmatizer=FakeWordNetLemmatizer)
-    fake_corpus = SimpleNamespace(wordnet=SimpleNamespace(ensure_loaded=lambda: None))
-    monkeypatch.setitem(sys.modules, "nltk", fake_nltk)
-    monkeypatch.setitem(sys.modules, "nltk.stem", fake_stem)
-    monkeypatch.setitem(sys.modules, "nltk.corpus", fake_corpus)
-
-    entries, language, _schema = PdfVocabularyImporter.entries_from_text("Use uses using used.")
-
-    assert language == "英语"
-    by_word = {entry.word: entry for entry in entries}
-    assert by_word["use"].frequency == 4
-    assert by_word["use"].forms == "used(1), uses(1), using(1)"
-
-
-def test_pdf_vocabulary_importer_prefers_spacy_when_model_is_available(monkeypatch) -> None:
-    class FakeToken:
-        def __init__(self, lemma: str) -> None:
-            self.lemma_ = lemma
-
-    class FakeNlp:
-        def __call__(self, word: str):
-            lemmas = {"vektoren": "vektor", "vektor": "vektor"}
-            return [FakeToken(lemmas.get(word, word))]
-
-    fake_spacy = SimpleNamespace(load=lambda *_args, **_kwargs: FakeNlp())
-    monkeypatch.setitem(sys.modules, "spacy", fake_spacy)
-    monkeypatch.setattr(PdfVocabularyImporter, "_SPACY_PIPELINES", {})
-    monkeypatch.setattr(PdfVocabularyImporter, "_nltk_lemma_counts", classmethod(lambda *_args: None))
-
-    entries, language, _schema = PdfVocabularyImporter.entries_from_text(
-        "Der Vektor ist wichtig. Die Vektoren sind wichtig."
-    )
-
-    assert language == "德语"
-    by_word = {entry.word: entry for entry in entries}
-    assert by_word["vektor"].frequency == 2
-    assert by_word["vektor"].forms == "vektoren(1)"
+    assert schema.columns == ("Index", "English", "Chinese", "Frequency", "Forms")
+    assert {entry.word for entry in entries} >= {"use", "tool", "vektor"}

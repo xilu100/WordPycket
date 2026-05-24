@@ -1,51 +1,27 @@
 from __future__ import annotations
 
-import gc
+import atexit
+from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
+import http.client
 import json
 import os
 import platform
-import re
+import queue
 import shutil
 import subprocess
 import sys
 import threading
 import time
-import urllib.request
+import uuid
 from dataclasses import dataclass
-from queue import Queue
 from pathlib import Path
-from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
-from typing import Any, Callable
+from typing import Any
 
 from wordpycket.domain.entities import WordEntry
 
 
 ProgressCallback = Any
 ControlCallback = Any
-
-
-def _is_llama_cleanup_error(unraisable: Any) -> bool:
-    return (
-        unraisable.exc_type is AttributeError
-        and "'LlamaModel' object has no attribute 'sampler'"
-        in str(unraisable.exc_value)
-    )
-
-
-def _install_llama_cleanup_error_filter() -> None:
-    current_hook = sys.unraisablehook
-    if getattr(current_hook, "_wordpycket_llama_filter", False):
-        return
-
-    def filter_llama_cleanup_error(unraisable: Any) -> None:
-        if not _is_llama_cleanup_error(unraisable):
-            current_hook(unraisable)
-
-    filter_llama_cleanup_error._wordpycket_llama_filter = True  # type: ignore[attr-defined]
-    sys.unraisablehook = filter_llama_cleanup_error
-
-
-_install_llama_cleanup_error_filter()
 
 
 @dataclass(frozen=True)
@@ -90,6 +66,8 @@ class ModelCheckResult:
 
 
 class LocalLlmExampleGenerator:
+    """HTTP client for the local llmserver process."""
+
     DEFAULT_MODEL_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
     DEFAULT_MODEL_FILENAME = "qwen2.5-3b-instruct-q4_k_m.gguf"
     DEFAULT_MODEL_URL = (
@@ -102,56 +80,47 @@ class LocalLlmExampleGenerator:
     _MPS_DEVICE = "mps"
 
     def __init__(self, model_dir: Path) -> None:
-        self._model_dir = model_dir
-        self._llms: list[Any | None] = []
-        self._llm_lock = threading.Lock()
+        self._model_dir = Path(model_dir)
+        self._process: subprocess.Popen[str] | None = None
+        self._base_url = os.getenv("WORDPYCKET_LLM_SERVER_URL", "").strip()
+        self._server_model_available = bool(self._base_url)
+        self._ready_messages: queue.Queue[str] | None = None
+        self._local_jobs: dict[str, dict[str, Any]] = {}
+        self._local_jobs_lock = threading.Lock()
+        self._server_start_lock = threading.Lock()
+        self._owns_process = False
+        atexit.register(self.close)
 
     def generate(self, entry: WordEntry, scope: str = "") -> GeneratedExample:
-        llm = self._load_model(0)
-        prompt = self._build_prompt(entry, scope)
-        content = self._call_model(llm, prompt)
-        return self._parse_response(content, require_meaning=not entry.meaning.strip())
-
-    def generate_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedExample:
-        if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
-            return self.generate(entry, scope)
-        data = self._run_isolated_worker("generate", entry, scope)
+        data = self._rpc("generate", {"entry": self._entry_payload(entry), "scope": scope})
         return GeneratedExample(
             example_sentence=str(data["example_sentence"]),
             example_sentence_cn=str(data["example_sentence_cn"]),
             meaning=str(data.get("meaning", "")),
         )
 
-    def correct_entry(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
-        llm = self._load_model(0)
-        prompt = self._build_correction_prompt(entry, scope)
-        content = self._call_model(llm, prompt)
-        return self._parse_correction_response(content, entry)
+    def generate_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedExample:
+        return self.generate(entry, scope)
 
-    def correct_entry_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
-        if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
-            return self.correct_entry(entry, scope)
-        data = self._run_isolated_worker("correct", entry, scope)
+    def correct_entry(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
+        data = self._rpc("correct_entry", {"entry": self._entry_payload(entry), "scope": scope})
         return GeneratedCorrection(
             corrected_word=str(data["corrected_word"]),
             note=str(data.get("note", "")),
         )
 
+    def correct_entry_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
+        return self.correct_entry(entry, scope)
+
     def explain_entry(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExplanation:
-        llm = self._load_model(0)
-        prompt = self._build_explanation_prompt(entry, scope, language)
-        content = self._call_model(
-            llm,
-            prompt,
-            system_prompt="You explain target-language vocabulary usage for Chinese learners. Return only valid JSON.",
+        data = self._rpc(
+            "explain_entry",
+            {"entry": self._entry_payload(entry), "scope": scope, "language": language},
         )
-        return self._parse_explanation_response(content)
+        return GeneratedExplanation(explanation=str(data["explanation"]))
 
     def explain_entry_isolated(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExplanation:
-        if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
-            return self.explain_entry(entry, scope, language)
-        data = self._run_isolated_worker("explain", entry, scope, language)
-        return GeneratedExplanation(explanation=str(data["explanation"]))
+        return self.explain_entry(entry, scope, language)
 
     def generate_many(
         self,
@@ -160,7 +129,19 @@ class LocalLlmExampleGenerator:
         progress: ProgressCallback | None = None,
         control: ControlCallback | None = None,
     ) -> tuple[list[tuple[WordEntry, GeneratedExample]], list[str], int]:
-        return self._run_parallel(entries, self._generate_with_slot, scope, progress, control)
+        raw_results, errors, workers = self._run_many_jobs(entries, "generate", scope, progress, control)
+        results = [
+            (
+                entry,
+                GeneratedExample(
+                    example_sentence=str(data["example_sentence"]),
+                    example_sentence_cn=str(data["example_sentence_cn"]),
+                    meaning=str(data.get("meaning", "")),
+                ),
+            )
+            for entry, data in raw_results
+        ]
+        return results, errors, workers
 
     def correct_many(
         self,
@@ -169,7 +150,18 @@ class LocalLlmExampleGenerator:
         progress: ProgressCallback | None = None,
         control: ControlCallback | None = None,
     ) -> tuple[list[tuple[WordEntry, GeneratedCorrection]], list[str], int]:
-        return self._run_parallel(entries, self._correct_with_slot, scope, progress, control)
+        raw_results, errors, workers = self._run_many_jobs(entries, "correct", scope, progress, control)
+        results = [
+            (
+                entry,
+                GeneratedCorrection(
+                    corrected_word=str(data["corrected_word"]),
+                    note=str(data.get("note", "")),
+                ),
+            )
+            for entry, data in raw_results
+        ]
+        return results, errors, workers
 
     def is_available(self) -> bool:
         return self._find_existing_model_path() is not None
@@ -186,14 +178,9 @@ class LocalLlmExampleGenerator:
         )
 
     def ensure_model_available(self) -> ModelStatus:
-        existing_path = self._find_existing_model_path()
-        if existing_path is not None:
-            return ModelStatus(
-                path=existing_path,
-                is_user_model=existing_path.name != self.DEFAULT_MODEL_FILENAME,
-            )
-        model_path = self._download_default_model()
-        return ModelStatus(path=model_path, is_user_model=False, downloaded=True)
+        status = self._model_status_from_payload(self._rpc("ensure_model_available"))
+        self._server_model_available = status.path is not None
+        return status
 
     def device_status(self) -> DeviceStatus:
         requested = os.getenv("WORDPYCKET_LLM_DEVICE", self._AUTO_DEVICE).lower()
@@ -211,7 +198,7 @@ class LocalLlmExampleGenerator:
 
         try:
             supports_gpu_offload = bool(llama_supports_gpu_offload())
-            selected = self._select_device(supports_gpu_offload)
+            selected = self._select_device(requested, detected, supports_gpu_offload)
         except Exception as error:
             return DeviceStatus(
                 requested=requested,
@@ -228,58 +215,105 @@ class LocalLlmExampleGenerator:
         )
 
     def check_model_runtime(self) -> ModelCheckResult:
-        model = self.ensure_model_available()
-        device = self.device_status()
-        if device.error:
-            raise RuntimeError(f"设备检查失败：{device.error}")
-        self.run_smoke_test_isolated()
-        return ModelCheckResult(model=model, device=device, smoke_test_passed=True)
+        data = self._rpc("check_model_runtime")
+        result = ModelCheckResult(
+            model=self._model_status_from_payload(data["model"]),
+            device=self._device_status_from_payload(data["device"]),
+            smoke_test_passed=bool(data["smoke_test_passed"]),
+        )
+        self._server_model_available = result.model.path is not None
+        return result
 
     def run_smoke_test_isolated(self) -> None:
-        if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
-            self._run_smoke_test()
-            return
-        data = self._run_isolated_worker(
-            "smoke_test",
-            WordEntry(word="test", meaning="测试"),
-            "",
+        data = self._rpc(
+            "run_action",
+            {
+                "action": "smoke_test",
+                "entry": self._entry_payload(WordEntry(word="test", meaning="测试")),
+                "scope": "",
+                "language": "",
+            },
         )
         if data.get("ok") is not True:
             raise RuntimeError(f"模型最小执行测试返回异常：{data}")
 
-    def _run_isolated_worker(
-        self,
-        action: str,
-        entry: WordEntry,
-        scope: str,
-        language: str = "",
-    ) -> dict[str, Any]:
-        env = self.isolated_environment()
-        payload = self.isolated_payload(action, entry, scope, language)
-        timeout = self._isolated_timeout_seconds()
-        try:
-            result = subprocess.run(
-                self.isolated_command(),
-                input=payload,
-                capture_output=True,
-                text=True,
-                encoding="utf-8",
-                env=env,
-                timeout=timeout,
-                check=False,
-            )
-        except subprocess.TimeoutExpired as error:
-            raise RuntimeError(f"模型子进程超过 {timeout} 秒未完成。") from error
+    def recommended_process_parallelism(self) -> int:
+        override = os.getenv("WORDPYCKET_LLM_PROCESS_PARALLEL")
+        if override is not None:
+            try:
+                return max(1, min(8, int(override)))
+            except ValueError as error:
+                raise RuntimeError("WORDPYCKET_LLM_PROCESS_PARALLEL 必须是整数。") from error
+        return int(self._rpc("recommended_process_parallelism"))
 
-        return self.parse_isolated_result(result.stdout, result.stderr, result.returncode)
+    def clean_pdf_vocabulary_entries(
+        self,
+        entries: list[WordEntry],
+        language: str = "",
+        progress_callback: Any | None = None,
+    ) -> list[WordEntry]:
+        job_id = self.submit_job(
+            "clean_pdf_vocabulary_entries",
+            {"entries": [self._entry_payload(entry) for entry in entries], "language": language},
+        )
+        data = self._wait_for_local_job(job_id, progress_callback)
+        return [self._entry_from_payload(item) for item in data]
+
+    def submit_job(self, method: str, params: dict[str, Any] | None = None) -> str:
+        job_id = uuid.uuid4().hex
+        with self._local_jobs_lock:
+            self._local_jobs[job_id] = {
+                "method": method,
+                "params": params or {},
+                "remote_job_id": "",
+                "state": "queued",
+                "stage": "queued",
+                "progress": {"message": "等待 LLM 服务", "percent": 0},
+                "result": None,
+                "error": "",
+            }
+        threading.Thread(target=self._drive_local_job, args=(job_id,), daemon=True).start()
+        return job_id
+
+    def job_status(self, job_id: str) -> dict[str, Any]:
+        with self._local_jobs_lock:
+            job = self._local_jobs.get(job_id)
+            if job is None:
+                raise RuntimeError(f"未知 LLM 任务：{job_id}")
+            return dict(job)
+
+    def close(self) -> None:
+        process = self._process
+        self._process = None
+        self._base_url = os.getenv("WORDPYCKET_LLM_SERVER_URL", "").strip()
+        self._server_model_available = bool(self._base_url)
+        self._ready_messages = None
+        if not self._owns_process:
+            return
+        self._owns_process = False
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    def __del__(self) -> None:
+        try:
+            self.close()
+        except Exception:
+            pass
 
     def isolated_command(self) -> list[str]:
         return [sys.executable, "-m", "wordpycket.infrastructure.example_generator"]
 
     def isolated_environment(self) -> dict[str, str]:
         env = os.environ.copy()
-        env["WORDPYCKET_LLM_CHILD"] = "1"
         env["PYTHONIOENCODING"] = "utf-8"
+        if self._base_url:
+            env["WORDPYCKET_LLM_SERVER_URL"] = self._base_url
         python_paths = [path for path in sys.path if path]
         existing_python_path = env.get("PYTHONPATH")
         if existing_python_path:
@@ -293,175 +327,111 @@ class LocalLlmExampleGenerator:
             "model_dir": str(self._model_dir),
             "scope": scope,
             "language": language,
-            "entry": {
-                "word": entry.word,
-                "meaning": entry.meaning,
-                "source_index": entry.source_index,
-                "frequency": entry.frequency,
-                "forms": entry.forms,
-                "example_sentence": entry.example_sentence,
-                "example_sentence_cn": entry.example_sentence_cn,
-            },
+            "entry": self._entry_payload(entry),
         }
         return json.dumps(payload, ensure_ascii=False)
 
-    def parse_isolated_result(
-        self,
-        stdout: str,
-        stderr: str,
-        returncode: int,
-    ) -> dict[str, Any]:
+    def isolated_pdf_import_environment(self) -> dict[str, str]:
+        env = self.isolated_environment()
+        env["WORDPYCKET_PDF_CHILD"] = "1"
+        return env
+
+    def isolated_pdf_import_payload(self, pdf_path: Path, csv_path: Path) -> str:
+        return json.dumps(
+            {
+                "pdf_path": str(pdf_path),
+                "csv_path": str(csv_path),
+                "use_llm_cleanup": True,
+                "model_dir": str(self._model_dir),
+            },
+            ensure_ascii=False,
+        )
+
+    def parse_isolated_result(self, stdout: str, stderr: str, returncode: int) -> dict[str, Any]:
         if returncode != 0:
-            recovered = self._parse_isolated_stdout(stdout)
-            if recovered is not None:
-                return recovered
-            detail = (stderr or stdout).strip()
-            if detail:
-                raise RuntimeError(f"模型子进程退出代码 {returncode}：{detail}")
-            raise RuntimeError(f"模型子进程退出代码 {returncode}。")
-
-        data = self._parse_isolated_stdout(stdout)
-        if data is None:
-            raise RuntimeError(f"模型子进程返回内容不是有效 JSON：{stdout}")
-        return data
-
-    def recommended_process_parallelism(self) -> int:
-        override = os.getenv("WORDPYCKET_LLM_PROCESS_PARALLEL")
-        if override is not None:
-            try:
-                return max(1, min(8, int(override)))
-            except ValueError as error:
-                raise RuntimeError("WORDPYCKET_LLM_PROCESS_PARALLEL 必须是整数。") from error
-
-        model_path = self._find_existing_model_path()
-        model_size_mb = self._model_size_mb(model_path)
-        memory_mb = self._system_memory_mb()
-        cpu_count = os.cpu_count() or 1
-
-        if self._detect_accelerator() == self._CUDA_DEVICE:
-            free_vram_mb = self._cuda_free_vram_mb()
-            if free_vram_mb is not None:
-                vram_per_worker_mb = max(2600, int(model_size_mb * 0.65) + 900)
-                ram_per_worker_mb = max(2600, int(model_size_mb * 0.9) + 900)
-                vram_workers = max(1, free_vram_mb // vram_per_worker_mb)
-                ram_workers = max(1, memory_mb // ram_per_worker_mb)
-                return max(1, min(4, vram_workers, ram_workers))
-            return 1
-
-        per_worker_mb = max(3600, int(model_size_mb * 2.0) + 1400)
-        memory_workers = max(1, memory_mb // per_worker_mb)
-        cpu_workers = max(1, cpu_count // self._threads_per_model())
-        return max(1, min(4, memory_workers, cpu_workers))
-
-    @staticmethod
-    def _parse_isolated_stdout(stdout: str) -> dict[str, Any] | None:
+            detail = "\n".join(part for part in (stderr.strip(), stdout.strip()) if part)
+            raise RuntimeError(f"模型子进程退出代码 {returncode}。{detail}")
+        lines = [line.strip() for line in stdout.splitlines() if line.strip()]
+        if not lines:
+            raise RuntimeError("模型子进程没有返回结果。")
         try:
-            data = json.loads(stdout)
-        except json.JSONDecodeError:
-            return None
+            data = json.loads(lines[-1])
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"模型子进程返回内容不是有效 JSON：{lines[-1]}") from error
         if not isinstance(data, dict):
-            return None
+            raise RuntimeError(f"模型子进程返回内容不是 JSON 对象：{data}")
+        if data.get("type") == "result":
+            result = data.get("data", {})
+            if not isinstance(result, dict):
+                raise RuntimeError(f"模型子进程 result.data 不是 JSON 对象：{data}")
+            return result
+        if data.get("type") == "error":
+            raise RuntimeError(str(data.get("error", "模型子进程失败。")))
         return data
 
-    @staticmethod
-    def _isolated_timeout_seconds() -> int:
-        raw_value = os.getenv("WORDPYCKET_LLM_TIMEOUT", "300")
-        try:
-            return max(1, int(raw_value))
-        except ValueError as error:
-            raise RuntimeError("WORDPYCKET_LLM_TIMEOUT 必须是整数秒。") from error
-
-    def _load_model(self, slot: int):
-        with self._llm_lock:
-            while len(self._llms) <= slot:
-                self._llms.append(None)
-            if self._llms[slot] is not None:
-                return self._llms[slot]
-
-            model_path = self._ensure_model_path()
-            if model_path is None:
-                raise RuntimeError("model 目录中没有找到 .gguf 模型文件。")
-
-            try:
-                from llama_cpp import Llama
-                from llama_cpp import llama_supports_gpu_offload
-            except ImportError as error:
-                raise RuntimeError(
-                    "缺少 llama-cpp-python。请先安装后再使用补充例句功能。"
-                ) from error
-
-            device = self._select_device(llama_supports_gpu_offload())
-            model_options = {
-                "model_path": str(model_path),
-                "n_ctx": self._context_size(model_path),
-                "n_threads": self._threads_per_model(),
-                "chat_format": "chatml",
-                "verbose": False,
-            }
-            if device in {self._CUDA_DEVICE, self._MPS_DEVICE}:
-                model_options["n_gpu_layers"] = self._gpu_layers()
-
-            try:
-                self._llms[slot] = self._create_llama(Llama, model_options)
-            except OSError as error:
-                if "0xc000001d" in str(error) or "-1073741795" in str(error):
-                    raise RuntimeError(
-                        "llama-cpp-python 当前 wheel 与这台机器的 CPU 指令集不兼容。"
-                        "请安装适合本机 CPU 的 no-AVX/basic 版本 wheel；"
-                        "如果有 NVIDIA CUDA，也可以安装 llama-cpp-python 的 CUDA wheel。"
-                    ) from error
-                raise
-            return self._llms[slot]
-
-    def _run_parallel(
+    def _run_many_jobs(
         self,
         entries: list[WordEntry],
-        worker: Any,
+        action: str,
         scope: str,
-        progress: ProgressCallback | None,
-        control: ControlCallback | None,
-    ):
+        progress: Any,
+        control: Any,
+    ) -> tuple[list[tuple[WordEntry, dict[str, Any]]], list[str], int]:
         if not entries:
             return [], [], 0
 
-        worker_count = min(len(entries), self._parallel_workers())
-        slots: Queue[int] = Queue()
-        for slot in range(worker_count):
-            slots.put(slot)
-
-        results = []
+        worker_count = min(len(entries), self.recommended_process_parallelism())
+        results: list[tuple[WordEntry, dict[str, Any]]] = []
         errors: list[str] = []
         done = 0
         next_index = 0
+        total = len(entries)
         active = set()
 
-        def wait_if_paused() -> bool:
+        def is_cancelled() -> bool:
             if control is None:
+                return False
+            if getattr(control, "cancelled", False):
                 return True
+            if callable(control):
+                return control() == "stopped"
+            return False
+
+        def run_entry(entry: WordEntry) -> tuple[WordEntry, dict[str, Any]]:
+            job_id = self.submit_job(
+                "run_action",
+                {
+                    "action": action,
+                    "entry": self._entry_payload(entry),
+                    "scope": scope,
+                    "language": "",
+                },
+            )
             while True:
-                state = control()
-                if state == "stopped":
-                    return False
-                if state != "paused":
-                    return True
-                threading.Event().wait(0.2)
+                status = self.job_status(job_id)
+                state = str(status.get("state", ""))
+                if state == "completed":
+                    result = status.get("result", {})
+                    if not isinstance(result, dict):
+                        raise RuntimeError(f"LLM 结果不是 JSON 对象：{result}")
+                    return entry, result
+                if state == "failed":
+                    raise RuntimeError(str(status.get("error", "LLM 任务失败。")))
+                time.sleep(self._poll_interval_seconds())
 
         def submit_next(executor: ThreadPoolExecutor) -> bool:
             nonlocal next_index
-            if next_index >= len(entries):
-                return False
-            if not wait_if_paused():
+            if next_index >= total or is_cancelled():
                 return False
             entry = entries[next_index]
             next_index += 1
-            active.add(executor.submit(self._run_with_slot, slots, worker, entry, scope))
+            active.add(executor.submit(run_entry, entry))
             return True
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
             for _ in range(worker_count):
                 if not submit_next(executor):
                     break
-
             while active:
                 finished, active = wait(active, return_when=FIRST_COMPLETED)
                 for future in finished:
@@ -471,182 +441,480 @@ class LocalLlmExampleGenerator:
                     except Exception as error:
                         errors.append(str(error))
                     if progress is not None:
-                        progress(done, len(entries), worker_count)
-
-                if control is not None and control() == "stopped":
-                    break
-
+                        progress(done, total)
                 while len(active) < worker_count and submit_next(executor):
                     pass
-
         return results, errors, worker_count
 
-    def _run_with_slot(
-        self,
-        slots: Queue[int],
-        worker: Any,
-        entry: WordEntry,
-        scope: str = "",
-    ):
-        slot = slots.get()
+    def _wait_for_local_job(self, job_id: str, progress_callback: Any | None = None) -> Any:
+        idle_deadline = time.monotonic() + self._operation_timeout_seconds()
+        last_progress: tuple[str, int] | None = None
+        while True:
+            if time.monotonic() >= idle_deadline:
+                raise RuntimeError(f"LLM 任务 {job_id} 超过 {self._operation_timeout_seconds()} 秒没有新进度。")
+            status = self.job_status(job_id)
+            progress = status.get("progress", {})
+            if isinstance(progress, dict):
+                message = str(progress.get("message", status.get("stage", "")))
+                percent = int(progress.get("percent", 0))
+                current_progress = (message, percent)
+                if current_progress != last_progress:
+                    idle_deadline = time.monotonic() + self._operation_timeout_seconds()
+                if progress_callback is not None and current_progress != last_progress:
+                    progress_callback(message, percent)
+                last_progress = current_progress
+            state = str(status.get("state", ""))
+            if state == "completed":
+                return status.get("result")
+            if state == "failed":
+                raise RuntimeError(str(status.get("error", "LLM 任务失败。")))
+            time.sleep(self._poll_interval_seconds())
+
+    def _drive_local_job(self, job_id: str) -> None:
         try:
-            return worker(slot, entry, scope)
+            self._ensure_server_for_local_job(job_id)
+            if self._local_job_requires_ready_model(job_id) and not self._server_model_available:
+                self._update_local_job(
+                    job_id,
+                    state="failed",
+                    stage="failed",
+                    error="LLM 服务未声明有可参与响应的模型。",
+                )
+                return
+            self._submit_remote_job(job_id)
+            while True:
+                with self._local_jobs_lock:
+                    job = self._local_jobs.get(job_id)
+                    if job is None:
+                        return
+                    if job.get("state") in {"completed", "failed"}:
+                        return
+                self._poll_remote_job(job_id)
+                time.sleep(self._poll_interval_seconds())
         except Exception as error:
-            raise RuntimeError(f"{entry.word}: {error}") from error
-        finally:
-            slots.put(slot)
-
-    def _generate_with_slot(
-        self,
-        slot: int,
-        entry: WordEntry,
-        scope: str = "",
-    ) -> tuple[WordEntry, GeneratedExample]:
-        llm = self._load_model(slot)
-        prompt = self._build_prompt(entry, scope)
-        content = self._call_model(llm, prompt)
-        return entry, self._parse_response(content, require_meaning=not entry.meaning.strip())
-
-    def _correct_with_slot(
-        self,
-        slot: int,
-        entry: WordEntry,
-        scope: str = "",
-    ) -> tuple[WordEntry, GeneratedCorrection]:
-        llm = self._load_model(slot)
-        prompt = self._build_correction_prompt(entry, scope)
-        content = self._call_model(llm, prompt)
-        return entry, self._parse_correction_response(content, entry)
-
-    def _parallel_workers(self) -> int:
-        override = os.getenv("WORDPYCKET_LLM_PARALLEL")
-        if override is not None:
-            try:
-                return max(1, int(override))
-            except ValueError as error:
-                raise RuntimeError("WORDPYCKET_LLM_PARALLEL 必须是整数。") from error
-
-        model_path = self._find_existing_model_path()
-        model_size_mb = self._model_size_mb(model_path)
-        if self._detect_accelerator() == self._CUDA_DEVICE:
-            free_vram_mb = self._cuda_free_vram_mb()
-            if free_vram_mb is not None:
-                per_worker_mb = max(2200, int(model_size_mb * 0.95) + 500)
-                return max(1, min(5, free_vram_mb // per_worker_mb))
-            return 1
-
-        if self._has_mps_device():
-            memory_mb = self._system_memory_mb()
-            per_worker_mb = max(3200, int(model_size_mb * 1.8) + 1200)
-            return max(1, min(3, memory_mb // per_worker_mb))
-
-        memory_mb = self._system_memory_mb()
-        cpu_count = os.cpu_count() or 1
-        per_worker_mb = max(3200, int(model_size_mb * 1.8) + 1200)
-        return max(1, min(3, cpu_count // self._threads_per_model(), memory_mb // per_worker_mb))
-
-    @staticmethod
-    def _threads_per_model() -> int:
-        return min(4, os.cpu_count() or 1)
-
-    @staticmethod
-    def _model_size_mb(model_path: Path | None) -> int:
-        if model_path is None:
-            return 2048
-        return max(1, model_path.stat().st_size // (1024 * 1024))
-
-    @staticmethod
-    def _cuda_free_vram_mb() -> int | None:
-        nvidia_smi = shutil.which("nvidia-smi")
-        if nvidia_smi is None:
-            return None
-        try:
-            result = subprocess.run(
-                [
-                    nvidia_smi,
-                    "--query-gpu=memory.free",
-                    "--format=csv,noheader,nounits",
-                ],
-                capture_output=True,
-                check=False,
-                text=True,
-                timeout=3,
+            self._update_local_job(
+                job_id,
+                state="failed",
+                stage="failed",
+                progress={"message": "LLM 任务失败", "percent": 100},
+                error=str(error),
             )
-        except (OSError, subprocess.TimeoutExpired):
-            return None
-        if result.returncode != 0:
-            return None
-        values = [
-            int(line.strip())
-            for line in result.stdout.splitlines()
-            if line.strip().isdigit()
-        ]
-        return max(values) if values else None
 
-    @staticmethod
-    def _system_memory_mb() -> int:
-        if platform.system() == "Windows":
-            try:
-                import ctypes
+    def _ensure_server_for_local_job(self, job_id: str) -> None:
+        if self._base_url:
+            return
+        self._update_local_job(
+            job_id,
+            state="queued",
+            stage="starting",
+            progress={"message": "等待 LLM 服务 ready", "percent": 0},
+        )
+        with self._server_start_lock:
+            if self._base_url:
+                return
+            self._start_server_blocking()
 
-                class MemoryStatus(ctypes.Structure):
-                    _fields_ = [
-                        ("dwLength", ctypes.c_ulong),
-                        ("dwMemoryLoad", ctypes.c_ulong),
-                        ("ullTotalPhys", ctypes.c_ulonglong),
-                        ("ullAvailPhys", ctypes.c_ulonglong),
-                        ("ullTotalPageFile", ctypes.c_ulonglong),
-                        ("ullAvailPageFile", ctypes.c_ulonglong),
-                        ("ullTotalVirtual", ctypes.c_ulonglong),
-                        ("ullAvailVirtual", ctypes.c_ulonglong),
-                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
-                    ]
+    def _start_server_blocking(self) -> None:
+        if self._process is not None and self._ready_messages is not None:
+            self._finish_async_server_start()
+            return
+        if self._process is None:
+            self._start_server_async()
+        self._finish_async_server_start()
 
-                status = MemoryStatus()
-                status.dwLength = ctypes.sizeof(status)
-                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
-                return max(1, status.ullAvailPhys // (1024 * 1024))
-            except Exception:
-                return 4096
-
-        if hasattr(os, "sysconf"):
-            try:
-                pages = os.sysconf("SC_AVPHYS_PAGES")
-                page_size = os.sysconf("SC_PAGE_SIZE")
-                return max(1, (pages * page_size) // (1024 * 1024))
-            except (OSError, ValueError):
-                return 4096
-        return 4096
-
-    @staticmethod
-    def _create_llama(llama_class: Any, model_options: dict[str, Any]) -> Any:
-        original_unraisablehook = sys.unraisablehook
-
-        def suppress_llama_cleanup_error(unraisable: Any) -> None:
-            if not _is_llama_cleanup_error(unraisable):
-                original_unraisablehook(unraisable)
-
-        sys.unraisablehook = suppress_llama_cleanup_error
+    def _finish_async_server_start(self) -> None:
+        if self._ready_messages is None:
+            return
         try:
-            return llama_class(**model_options)
-        except BaseException:
-            gc.collect()
-            raise
+            line = self._ready_messages.get(timeout=self._startup_timeout_seconds()).strip()
+        except queue.Empty as error:
+            self._stop_unready_process()
+            raise RuntimeError(f"LLM 服务 {self._startup_timeout_seconds()} 秒内没有发送 ready JSON，停止等待。") from error
+        if not line:
+            self._stop_unready_process()
+            raise RuntimeError("LLM 服务启动失败。")
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError as error:
+            self._stop_unready_process()
+            raise RuntimeError(f"LLM 服务未返回 JSON：{line}") from error
+        if not isinstance(data, dict) or data.get("type") != "ready":
+            self._stop_unready_process()
+            raise RuntimeError(f"LLM 服务未 ready：{data}")
+        self._base_url = f"http://{data['host']}:{int(data['port'])}"
+        self._server_model_available = bool(data.get("model_available"))
+        self._ready_messages = None
+        self._update_waiting_local_jobs(
+            state="queued",
+            stage="ready",
+            progress={"message": "LLM 服务已 ready", "percent": 1},
+        )
+
+    def _local_job_requires_ready_model(self, job_id: str) -> bool:
+        with self._local_jobs_lock:
+            job = self._local_jobs.get(job_id)
+            if job is None:
+                return False
+            return self._method_requires_ready_model(str(job["method"]), job.get("params"))
+
+    def _update_local_job(self, job_id: str, **changes: Any) -> None:
+        with self._local_jobs_lock:
+            job = self._local_jobs.get(job_id)
+            if job is not None:
+                job.update(changes)
+
+    def _update_waiting_local_jobs(self, **changes: Any) -> None:
+        with self._local_jobs_lock:
+            for job in self._local_jobs.values():
+                if job.get("state") in {"queued", "running"} and not job.get("remote_job_id"):
+                    job.update(changes)
+
+    def _rpc(
+        self,
+        method: str,
+        params: dict[str, Any] | None = None,
+        progress_callback: Any | None = None,
+    ) -> Any:
+        base_url = self._ensure_server(require_model=self._method_requires_ready_model(method, params))
+        job = self._request_json(
+            base_url,
+            {
+                "method": "submit_job",
+                "params": {
+                    "method": method,
+                    "params": params or {},
+                },
+            },
+        )
+        result = job.get("result")
+        if not isinstance(result, dict) or not result.get("job_id"):
+            raise RuntimeError(f"LLM 服务没有返回有效 job_id：{job}")
+        return self._wait_for_job(base_url, str(result["job_id"]), progress_callback)
+
+    def _request_json(self, base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
+        host, port = self._parse_base_url(base_url)
+        body = json.dumps(payload, ensure_ascii=False)
+        connection = http.client.HTTPConnection(host, port, timeout=self._request_timeout_seconds())
+        try:
+            connection.request("POST", "/rpc", body=body.encode("utf-8"), headers={"Content-Type": "application/json"})
+            response = connection.getresponse()
+            payload = json.loads(response.read().decode("utf-8"))
         finally:
-            sys.unraisablehook = original_unraisablehook
+            connection.close()
+        if not isinstance(payload, dict):
+            raise RuntimeError("LLM 服务返回内容不是 JSON 对象。")
+        if not payload.get("ok"):
+            raise RuntimeError(str(payload.get("error", "LLM 服务调用失败。")))
+        return payload
+
+    def _wait_for_job(self, base_url: str, job_id: str, progress_callback: Any | None = None) -> Any:
+        deadline = time.monotonic() + self._operation_timeout_seconds()
+        last_progress: tuple[str, int] | None = None
+        while True:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(f"LLM 任务 {job_id} 超过 {self._operation_timeout_seconds()} 秒未完成。")
+            payload = self._request_json(
+                base_url,
+                {"method": "job_status", "params": {"job_id": job_id}},
+            )
+            status = payload.get("result")
+            if not isinstance(status, dict):
+                raise RuntimeError(f"LLM 任务状态不是 JSON 对象：{payload}")
+            progress = status.get("progress", {})
+            if isinstance(progress, dict):
+                message = str(progress.get("message", status.get("stage", "")))
+                percent = int(progress.get("percent", 0))
+                current_progress = (message, percent)
+                if progress_callback is not None and current_progress != last_progress:
+                    progress_callback(message, percent)
+                last_progress = current_progress
+            state = str(status.get("state", ""))
+            if state == "completed":
+                return status.get("result")
+            if state == "failed":
+                raise RuntimeError(str(status.get("error", "LLM 任务失败。")))
+            time.sleep(self._poll_interval_seconds())
+
+    def _ensure_server(self, require_model: bool = True) -> str:
+        if self._base_url:
+            if require_model and not self._server_model_available:
+                raise RuntimeError("LLM 服务未声明有可参与响应的模型。")
+            return self._base_url
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        python_paths = [path for path in sys.path if path]
+        existing_python_path = env.get("PYTHONPATH")
+        if existing_python_path:
+            python_paths.append(existing_python_path)
+        env["PYTHONPATH"] = os.pathsep.join(python_paths)
+        self._process = subprocess.Popen(
+            [sys.executable, "-m", "llmserver.server", "--model-dir", str(self._model_dir)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
+        self._owns_process = True
+        assert self._process.stdout is not None
+        try:
+            data = self._read_ready_message(self._process)
+        except Exception:
+            self._stop_unready_process()
+            raise
+        if data.get("type") != "ready":
+            self._stop_unready_process()
+            raise RuntimeError(f"LLM 服务启动消息不是 ready JSON：{data}")
+        self._base_url = f"http://{data['host']}:{int(data['port'])}"
+        self._server_model_available = bool(data.get("model_available"))
+        if require_model and not self._server_model_available:
+            self._stop_unready_process()
+            raise RuntimeError("LLM 服务未声明有可参与响应的模型。")
+        return self._base_url
+
+    def _start_server_async(self) -> None:
+        if self._process is not None:
+            return
+        env = os.environ.copy()
+        env["PYTHONIOENCODING"] = "utf-8"
+        python_paths = [path for path in sys.path if path]
+        existing_python_path = env.get("PYTHONPATH")
+        if existing_python_path:
+            python_paths.append(existing_python_path)
+        env["PYTHONPATH"] = os.pathsep.join(python_paths)
+        self._process = subprocess.Popen(
+            [sys.executable, "-m", "llmserver.server", "--model-dir", str(self._model_dir)],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+            encoding="utf-8",
+            env=env,
+        )
+        self._owns_process = True
+        assert self._process.stdout is not None
+        self._ready_messages = queue.Queue(maxsize=1)
+
+        def read_ready() -> None:
+            assert self._process is not None and self._process.stdout is not None
+            try:
+                self._ready_messages.put(self._process.stdout.readline())
+            except Exception as error:
+                self._ready_messages.put(json.dumps({"type": "error", "error": str(error)}))
+
+        threading.Thread(target=read_ready, daemon=True).start()
+
+    def _advance_server_start(self, job: dict[str, Any]) -> None:
+        if self._ready_messages is None:
+            self._start_server_async()
+            return
+        try:
+            line = self._ready_messages.get_nowait().strip()
+        except queue.Empty:
+            job.update(
+                {
+                    "state": "queued",
+                    "stage": "starting",
+                    "progress": {"message": "等待 LLM 服务 ready", "percent": 0},
+                }
+            )
+            return
+        if not line:
+            job.update({"state": "failed", "stage": "failed", "error": "LLM 服务启动失败。"})
+            return
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError:
+            job.update({"state": "failed", "stage": "failed", "error": f"LLM 服务未返回 JSON：{line}"})
+            return
+        if not isinstance(data, dict) or data.get("type") != "ready":
+            job.update({"state": "failed", "stage": "failed", "error": f"LLM 服务未 ready：{data}"})
+            return
+        self._base_url = f"http://{data['host']}:{int(data['port'])}"
+        self._server_model_available = bool(data.get("model_available"))
+        if self._method_requires_ready_model(str(job["method"]), job.get("params")) and not self._server_model_available:
+            job.update({"state": "failed", "stage": "failed", "error": "LLM 服务未声明有可参与响应的模型。"})
+            return
+        job.update(
+            {
+                "state": "queued",
+                "stage": "ready",
+                "progress": {"message": "LLM 服务已 ready", "percent": 1},
+            }
+        )
+
+    def _submit_remote_job(self, job_id: str) -> None:
+        with self._local_jobs_lock:
+            job = self._local_jobs.get(job_id)
+            if job is None:
+                return
+            method = job["method"]
+            params = job["params"]
+        payload = self._request_json(
+            self._base_url,
+            {
+                "method": "submit_job",
+                "params": {"method": method, "params": params},
+            },
+        )
+        result = payload.get("result")
+        if not isinstance(result, dict) or not result.get("job_id"):
+            self._update_local_job(
+                job_id,
+                state="failed",
+                stage="failed",
+                error=f"LLM 服务没有返回 job_id：{payload}",
+            )
+            return
+        self._update_local_job(
+            job_id,
+            remote_job_id=str(result["job_id"]),
+            state="queued",
+            stage="submitted",
+            progress={"message": "任务已提交给 LLM", "percent": 1},
+        )
+
+    def _poll_remote_job(self, job_id: str) -> None:
+        with self._local_jobs_lock:
+            job = self._local_jobs.get(job_id)
+            if job is None:
+                return
+            remote_job_id = str(job["remote_job_id"])
+        payload = self._request_json(
+            self._base_url,
+            {"method": "job_status", "params": {"job_id": remote_job_id}},
+        )
+        status = payload.get("result")
+        if not isinstance(status, dict):
+            self._update_local_job(
+                job_id,
+                state="failed",
+                stage="failed",
+                error=f"LLM 任务状态不是 JSON：{payload}",
+            )
+            return
+        self._update_local_job(job_id, **status)
+
+    def _read_ready_message(self, process: subprocess.Popen[str]) -> dict[str, Any]:
+        assert process.stdout is not None
+        messages: queue.Queue[str] = queue.Queue(maxsize=1)
+
+        def read_line() -> None:
+            try:
+                messages.put(process.stdout.readline())
+            except Exception as error:
+                messages.put(json.dumps({"type": "error", "error": str(error)}))
+
+        thread = threading.Thread(target=read_line, daemon=True)
+        thread.start()
+        timeout = self._startup_timeout_seconds()
+        try:
+            line = messages.get(timeout=timeout).strip()
+        except queue.Empty as error:
+            raise RuntimeError(f"LLM 服务 {timeout} 秒内没有发送 ready JSON，停止等待。") from error
+        if not line:
+            stderr = ""
+            if process.poll() is not None and process.stderr is not None:
+                stderr = process.stderr.read().strip()
+            raise RuntimeError(f"LLM 服务启动失败。{stderr}")
+        try:
+            data = json.loads(line)
+        except json.JSONDecodeError as error:
+            raise RuntimeError(f"LLM 服务启动消息不是有效 JSON：{line}") from error
+        if not isinstance(data, dict):
+            raise RuntimeError(f"LLM 服务启动消息不是 JSON 对象：{data}")
+        return data
+
+    def _stop_unready_process(self) -> None:
+        process = self._process
+        self._process = None
+        self._base_url = ""
+        self._server_model_available = False
+        self._owns_process = False
+        if process is None or process.poll() is not None:
+            return
+        process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+
+    @staticmethod
+    def _method_requires_ready_model(method: str, params: dict[str, Any] | None) -> bool:
+        if method in {
+            "ensure_model_available",
+            "device_status",
+            "check_model_runtime",
+            "recommended_process_parallelism",
+        }:
+            return False
+        if method == "run_action" and isinstance(params, dict) and params.get("action") == "smoke_test":
+            return False
+        return True
+
+    @staticmethod
+    def _startup_timeout_seconds() -> int:
+        raw_value = os.getenv("WORDPYCKET_LLM_STARTUP_TIMEOUT", "5")
+        try:
+            return max(1, int(raw_value))
+        except ValueError as error:
+            raise RuntimeError("WORDPYCKET_LLM_STARTUP_TIMEOUT 必须是整数秒。") from error
+
+    def _find_existing_model_path(self) -> Path | None:
+        if not self._model_dir.exists():
+            return None
+
+        models = sorted(
+            self._model_dir.glob("*.gguf"),
+            key=lambda path: (
+                path.name != self.DEFAULT_MODEL_FILENAME,
+                -path.stat().st_size,
+            ),
+        )
+        if len(models) > 1:
+            names = "、".join(path.name for path in models)
+            raise RuntimeError(f"model 目录中只能存在一个 .gguf 模型文件。当前存在：{names}")
+        return models[0] if models else None
+
+    @staticmethod
+    def _request_timeout_seconds() -> int:
+        raw_value = os.getenv("WORDPYCKET_LLM_HTTP_TIMEOUT", "5")
+        try:
+            return max(1, int(raw_value))
+        except ValueError as error:
+            raise RuntimeError("WORDPYCKET_LLM_HTTP_TIMEOUT 必须是整数秒。") from error
+
+    @staticmethod
+    def _operation_timeout_seconds() -> int:
+        raw_value = os.getenv("WORDPYCKET_LLM_TIMEOUT", "300")
+        try:
+            return max(1, int(raw_value))
+        except ValueError as error:
+            raise RuntimeError("WORDPYCKET_LLM_TIMEOUT 必须是整数秒。") from error
+
+    @staticmethod
+    def _poll_interval_seconds() -> float:
+        raw_value = os.getenv("WORDPYCKET_LLM_POLL_INTERVAL", "0.25")
+        try:
+            return max(0.05, float(raw_value))
+        except ValueError as error:
+            raise RuntimeError("WORDPYCKET_LLM_POLL_INTERVAL 必须是数字秒。") from error
+
+    @staticmethod
+    def _parse_base_url(base_url: str) -> tuple[str, int]:
+        if not base_url.startswith("http://"):
+            raise RuntimeError("WORDPYCKET_LLM_SERVER_URL 目前只支持 http:// 地址。")
+        value = base_url.removeprefix("http://").rstrip("/")
+        host, _, port_text = value.partition(":")
+        return host, int(port_text)
 
     @classmethod
-    def _select_device(cls, supports_gpu_offload: bool) -> str:
-        requested = os.getenv("WORDPYCKET_LLM_DEVICE", cls._AUTO_DEVICE).lower()
+    def _select_device(cls, requested: str, detected: str, supports_gpu_offload: bool) -> str:
         allowed = {cls._AUTO_DEVICE, cls._CPU_DEVICE, cls._CUDA_DEVICE, cls._MPS_DEVICE}
         if requested not in allowed:
-            raise RuntimeError(
-                "WORDPYCKET_LLM_DEVICE 只能设置为 auto、cpu、cuda 或 mps。"
-            )
+            raise RuntimeError("WORDPYCKET_LLM_DEVICE 只能设置为 auto、cpu、cuda 或 mps。")
         if requested == cls._CPU_DEVICE:
             return cls._CPU_DEVICE
-
-        detected = cls._detect_accelerator()
         if requested in {cls._CUDA_DEVICE, cls._MPS_DEVICE}:
             if requested != detected:
                 raise RuntimeError(f"没有检测到可用的 {requested.upper()} 加速设备。")
@@ -656,7 +924,6 @@ class LocalLlmExampleGenerator:
                     f"请安装支持 {requested.upper()} 的 wheel，或设置 WORDPYCKET_LLM_DEVICE=cpu。"
                 )
             return requested
-
         if supports_gpu_offload and detected in {cls._CUDA_DEVICE, cls._MPS_DEVICE}:
             return detected
         return cls._CPU_DEVICE
@@ -692,675 +959,70 @@ class LocalLlmExampleGenerator:
     def _has_mps_device() -> bool:
         return platform.system() == "Darwin" and platform.machine() in {"arm64", "arm"}
 
-    @classmethod
-    def _context_size(cls, model_path: Path | None = None) -> int:
-        raw_value = os.getenv("WORDPYCKET_LLM_CONTEXT")
-        if raw_value is None:
-            return cls._auto_context_size(model_path)
-        try:
-            return max(2048, min(32768, int(raw_value)))
-        except ValueError as error:
-            raise RuntimeError("WORDPYCKET_LLM_CONTEXT 必须是整数。") from error
-
-    @classmethod
-    def _auto_context_size(cls, model_path: Path | None = None) -> int:
-        memory_mb = cls._system_memory_mb()
-        model_size_mb = cls._model_size_mb(model_path)
-        cpu_count = os.cpu_count() or 1
-
-        if cls._detect_accelerator() == cls._CUDA_DEVICE:
-            free_vram_mb = cls._cuda_free_vram_mb()
-            if free_vram_mb is not None:
-                budget_mb = min(memory_mb, max(0, free_vram_mb - max(1200, model_size_mb // 3)))
-                if budget_mb >= 15000:
-                    return 32768
-                if budget_mb >= 8500:
-                    return 16384
-                if budget_mb >= 4200:
-                    return 8192
-                return 4096 if budget_mb >= 2500 else 2048
-
-        if cls._has_mps_device():
-            if memory_mb >= 48000:
-                return 32768
-            if memory_mb >= 24000:
-                return 16384
-            if memory_mb >= 12000:
-                return 8192
-            return 4096
-
-        if memory_mb >= 48000 and cpu_count >= 12:
-            return 16384
-        if memory_mb >= 24000 and cpu_count >= 8:
-            return 8192
-        return 4096 if memory_mb >= 8000 else 2048
+    @staticmethod
+    def _entry_payload(entry: WordEntry) -> dict[str, Any]:
+        return {
+            "word": entry.word,
+            "meaning": entry.meaning,
+            "source_index": entry.source_index,
+            "frequency": entry.frequency,
+            "forms": entry.forms,
+            "example_sentence": entry.example_sentence,
+            "example_sentence_cn": entry.example_sentence_cn,
+        }
 
     @staticmethod
-    def _gpu_layers() -> int:
-        raw_value = os.getenv("WORDPYCKET_LLM_GPU_LAYERS")
-        if raw_value is None:
-            return -1
-        try:
-            return int(raw_value)
-        except ValueError as error:
-            raise RuntimeError("WORDPYCKET_LLM_GPU_LAYERS 必须是整数。") from error
-
-    def clean_pdf_vocabulary_entries(
-        self,
-        entries: list[WordEntry],
-        language: str,
-        progress_callback: Callable[[str, int], None] | None = None,
-    ) -> list[WordEntry]:
-        if not entries:
-            return []
-        llm = self._load_model(0)
-        removed_indexes: set[int] = set()
-        batches = self._pdf_clean_batches(entries)
-        total_batches = len(batches)
-        for batch_index, batch in enumerate(batches, start=1):
-            if progress_callback is not None:
-                percent = 40 + int((batch_index - 1) / max(1, total_batches) * 40)
-                progress_callback(f"AI 审阅 CSV：{batch_index}/{total_batches}", percent)
-            prompt = self._build_pdf_vocabulary_cleaning_prompt(batch, language)
-            content = self._call_model(
-                llm,
-                prompt,
-                system_prompt="You review generated vocabulary CSV rows. Return only valid JSON.",
-                max_tokens=256,
-            )
-            removed_indexes.update(self._parse_pdf_vocabulary_cleaning_response(content, batch))
-            if progress_callback is not None:
-                percent = 40 + int(batch_index / max(1, total_batches) * 40)
-                progress_callback(f"AI 审阅 CSV：已完成 {batch_index}/{total_batches}", percent)
-        if progress_callback is not None:
-            progress_callback("AI 审阅 CSV 完成", 80)
-        return [
-            WordEntry(
-                id=entry.id,
-                word=entry.word,
-                meaning=entry.meaning,
-                source_index=index,
-                frequency=entry.frequency,
-                forms=entry.forms,
-                example_sentence=entry.example_sentence,
-                example_sentence_cn=entry.example_sentence_cn,
-                created_at=entry.created_at,
-                mastery_level=entry.mastery_level,
-                review_count=entry.review_count,
-                correct_count=entry.correct_count,
-                wrong_count=entry.wrong_count,
-                last_reviewed_at=entry.last_reviewed_at,
-                learned_available_at=entry.learned_available_at,
-            )
-            for index, entry in enumerate(
-                (entry for entry in entries if entry.source_index not in removed_indexes),
-                start=1,
-            )
-        ]
-
-    @classmethod
-    def _pdf_clean_batches(cls, entries: list[WordEntry]) -> list[list[WordEntry]]:
-        max_rows = cls._pdf_clean_batch_size()
-        char_budget = cls._pdf_clean_prompt_char_budget()
-        batches: list[list[WordEntry]] = []
-        current: list[WordEntry] = []
-        current_size = 0
-        for entry in entries:
-            row_size = len(json.dumps(cls._csv_review_row(entry), ensure_ascii=False, separators=(",", ":")))
-            if current and (len(current) >= max_rows or current_size + row_size > char_budget):
-                batches.append(current)
-                current = []
-                current_size = 0
-            current.append(entry)
-            current_size += row_size
-        if current:
-            batches.append(current)
-        return batches
-
-    @staticmethod
-    def _pdf_clean_batch_size() -> int:
-        raw_value = os.getenv("WORDPYCKET_PDF_CLEAN_BATCH")
-        if raw_value is None:
-            return LocalLlmExampleGenerator._auto_pdf_clean_batch_size()
-        try:
-            return max(10, min(100, int(raw_value)))
-        except ValueError as error:
-            raise RuntimeError("WORDPYCKET_PDF_CLEAN_BATCH 必须是整数。") from error
-
-    @staticmethod
-    def _pdf_clean_prompt_char_budget() -> int:
-        raw_value = os.getenv("WORDPYCKET_PDF_CLEAN_CHARS")
-        if raw_value is None:
-            return LocalLlmExampleGenerator._auto_pdf_clean_prompt_char_budget()
-        try:
-            return max(1000, min(12000, int(raw_value)))
-        except ValueError as error:
-            raise RuntimeError("WORDPYCKET_PDF_CLEAN_CHARS 必须是整数。") from error
-
-    @classmethod
-    def _auto_pdf_clean_batch_size(cls) -> int:
-        context = cls._context_size()
-        memory_mb = cls._system_memory_mb()
-        cpu_count = os.cpu_count() or 1
-        if context >= 16384:
-            rows = 100
-        elif context >= 8192:
-            rows = 80
-        elif context >= 4096:
-            rows = 50
-        else:
-            rows = 25
-        if memory_mb < 6000:
-            rows = min(rows, 25)
-        elif memory_mb < 10000:
-            rows = min(rows, 40)
-        if cpu_count <= 4:
-            rows = min(rows, 35)
-        return max(10, min(100, rows))
-
-    @classmethod
-    def _auto_pdf_clean_prompt_char_budget(cls) -> int:
-        context = cls._context_size()
-        if context >= 32768:
-            budget = 12000
-        elif context >= 16384:
-            budget = 10000
-        elif context >= 8192:
-            budget = 7500
-        elif context >= 4096:
-            budget = 4500
-        else:
-            budget = 2500
-        if cls._system_memory_mb() < 6000:
-            budget = min(budget, 2500)
-        return max(1000, min(12000, budget))
-
-    @staticmethod
-    def _csv_review_row(entry: WordEntry) -> list[int | str]:
-        return [
-            entry.source_index,
-            LocalLlmExampleGenerator._truncate_for_prompt(entry.word, 80),
-            entry.frequency,
-            LocalLlmExampleGenerator._truncate_for_prompt(entry.forms, 80),
-        ]
-
-    @staticmethod
-    def _truncate_for_prompt(value: str, limit: int) -> str:
-        if len(value) <= limit:
-            return value
-        return f"{value[:limit]}..."
-
-    @staticmethod
-    def _build_pdf_vocabulary_cleaning_prompt(entries: list[WordEntry], language: str) -> str:
-        rows = [LocalLlmExampleGenerator._csv_review_row(entry) for entry in entries]
-        return (
-            "You are reviewing a rough vocabulary CSV generated from PDF text.\n"
-            f"Detected language: {language}\n"
-            "Rows are arrays: [csv_index, term, frequency, forms].\n"
-            "For each row, decide whether term is a real learnable word or meaningful terminology phrase.\n"
-            "Remove rows that are not learnable vocabulary terms, including:\n"
-            "- programming keywords or code/control-flow fragments such as if, else, endif, end if, return, for, while;\n"
-            "- variable/function identifiers, library names, filenames, URLs, emails, or code fragments;\n"
-            "- letter noise, OCR fragments, or non-words such as xy, abc, tmp, idx, foo, bar when they are not established terms;\n"
-            "- full person names, author-list names, organization names, venue names, or bibliography artifacts;\n"
-            "- page/header/footer artifacts, citation markers, broken fragments, or table labels.\n"
-            "Keep rows that are real words, academic terms, domain terms, abbreviations with established meaning, "
-            "or meaningful fixed phrases, even if they are rare.\n"
-            "Keep eponyms and name-derived technical terms when they are used as concepts, methods, or adjectives, "
-            "such as Fourier, Gaussian, Bayesian, Newtonian, Eulerian, Markov, Laplace, Hamiltonian, or Turing.\n"
-            "Delete a name-derived term only when it is clearly just an author/person entry or bibliography residue.\n"
-            "Review only these CSV rows. Do not infer from the original PDF. "
-            "You will receive at most 100 rows in this batch. "
-            "Return only the csv_index values from the first column. Do not return batch row numbers. "
-            "Do not include reasons or explanations.\n"
-            "Return JSON only, exactly like: {\"remove_csv_indexes\": [101, 102]}\n"
-            f"CSV rows:\n{json.dumps(rows, ensure_ascii=False, separators=(',', ':'))}"
+    def _entry_from_payload(data: dict[str, Any]) -> WordEntry:
+        return WordEntry(
+            word=str(data.get("word", "")),
+            meaning=str(data.get("meaning", "")),
+            source_index=int(data.get("source_index", 0)),
+            frequency=int(data.get("frequency", 0)),
+            forms=str(data.get("forms", "")),
+            example_sentence=str(data.get("example_sentence", "")),
+            example_sentence_cn=str(data.get("example_sentence_cn", "")),
         )
 
     @staticmethod
-    def _parse_pdf_vocabulary_cleaning_response(content: str, batch: list[WordEntry]) -> set[int]:
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-            cleaned = re.sub(r"```$", "", cleaned).strip()
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if match:
-            cleaned = match.group(0)
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError:
-            return LocalLlmExampleGenerator._parse_pdf_cleaning_numbers(content, batch)
-        if isinstance(data, list):
-            data = {"remove_csv_indexes": data}
-        if not isinstance(data, dict):
-            return set()
-
-        valid_indexes = {entry.source_index for entry in batch}
-        indexes: set[int] = set()
-        raw_indexes = data.get(
-            "remove_csv_indexes",
-            data.get("remove_source_indexes", data.get("remove", [])),
-        )
-        if isinstance(raw_indexes, list):
-            for value in raw_indexes:
-                index = LocalLlmExampleGenerator._coerce_pdf_clean_index(value, batch, valid_indexes)
-                if index is not None:
-                    indexes.add(index)
-
-        raw_words = data.get("remove_words", [])
-        if isinstance(raw_words, list):
-            words = {str(word).strip().lower() for word in raw_words}
-            indexes.update(
-                entry.source_index
-                for entry in batch
-                if entry.word.lower() in words
-            )
-        return indexes
-
-    @staticmethod
-    def _parse_pdf_cleaning_numbers(content: str, batch: list[WordEntry]) -> set[int]:
-        valid_indexes = {entry.source_index for entry in batch}
-        indexes: set[int] = set()
-        for value in re.findall(r"\b\d+\b", content):
-            index = LocalLlmExampleGenerator._coerce_pdf_clean_index(value, batch, valid_indexes)
-            if index is not None:
-                indexes.add(index)
-        return indexes
-
-    @staticmethod
-    def _coerce_pdf_clean_index(
-        value: Any,
-        batch: list[WordEntry],
-        valid_indexes: set[int],
-    ) -> int | None:
-        try:
-            index = int(value)
-        except (TypeError, ValueError):
-            return None
-        if index in valid_indexes:
-            return index
-        if 1 <= index <= len(batch):
-            return batch[index - 1].source_index
-        return None
-
-    @staticmethod
-    def _call_model(
-        llm: Any,
-        prompt: str,
-        system_prompt: str | None = None,
-        max_tokens: int = 200,
-    ) -> str:
-        messages = [
-            {
-                "role": "system",
-                "content": system_prompt
-                or "You generate concise English vocabulary examples. Return only valid JSON.",
-            },
-            {"role": "user", "content": prompt},
-        ]
-        try:
-            response = llm.create_chat_completion(
-                messages=messages,
-                temperature=0.4,
-                max_tokens=max_tokens,
-                response_format={"type": "json_object"},
-            )
-            return LocalLlmExampleGenerator._extract_chat_content(response)
-        except (KeyError, TypeError, ValueError, AttributeError):
-            response = llm.create_completion(
-                prompt=LocalLlmExampleGenerator._build_completion_prompt(prompt, system_prompt),
-                temperature=0.4,
-                max_tokens=max_tokens,
-                stop=["\n\n"],
-            )
-            return LocalLlmExampleGenerator._extract_completion_text(response)
-
-    def _run_smoke_test(self) -> None:
-        llm = self._load_model(0)
-        content = self._call_smoke_model(llm)
-        try:
-            data = json.loads(content)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f"模型最小执行测试返回内容不是有效 JSON：{content}") from error
-        if not isinstance(data, dict) or data.get("ok") is not True:
-            raise RuntimeError(f"模型最小执行测试返回异常：{content}")
-
-    @staticmethod
-    def _call_smoke_model(llm: Any) -> str:
-        messages = [
-            {"role": "system", "content": "Return only valid JSON."},
-            {"role": "user", "content": 'Return exactly {"ok": true}.'},
-        ]
-        try:
-            response = llm.create_chat_completion(
-                messages=messages,
-                temperature=0,
-                max_tokens=16,
-                response_format={"type": "json_object"},
-            )
-            return LocalLlmExampleGenerator._extract_chat_content(response)
-        except (KeyError, TypeError, ValueError, AttributeError):
-            response = llm.create_completion(
-                prompt='Return only valid JSON.\n\nReturn exactly {"ok": true}.\n\nJSON:',
-                temperature=0,
-                max_tokens=16,
-                stop=["\n\n"],
-            )
-            return LocalLlmExampleGenerator._extract_completion_text(response)
-
-    @staticmethod
-    def _extract_chat_content(response: Any) -> str:
-        choices = response["choices"]
-        message = choices[0]["message"]
-        content = message["content"]
-        if isinstance(content, dict):
-            return json.dumps(content, ensure_ascii=False)
-        if isinstance(content, list):
-            return "".join(
-                str(item.get("text", ""))
-                for item in content
-                if isinstance(item, dict)
-            )
-        return str(content)
-
-    @staticmethod
-    def _extract_completion_text(response: Any) -> str:
-        return str(response["choices"][0]["text"])
-
-    @staticmethod
-    def _build_completion_prompt(prompt: str, system_prompt: str | None = None) -> str:
-        return (
-            f"{system_prompt or 'You generate concise English vocabulary examples. Return only valid JSON.'}\n\n"
-            f"{prompt}\n\nJSON:"
-        )
-
-    def _find_existing_model_path(self) -> Path | None:
-        if not self._model_dir.exists():
-            return None
-
-        models = sorted(
-            self._model_dir.glob("*.gguf"),
-            key=lambda path: (
-                path.name != self.DEFAULT_MODEL_FILENAME,
-                -path.stat().st_size,
-            ),
-        )
-        if len(models) > 1:
-            names = "、".join(path.name for path in models)
-            raise RuntimeError(f"model 目录中只能存在一个 .gguf 模型文件。当前存在：{names}")
-        return models[0] if models else None
-
-    def _ensure_model_path(self) -> Path | None:
-        model_path = self._find_existing_model_path()
-        if model_path is not None:
-            return model_path
-        return self._download_default_model()
-
-    def _download_default_model(self) -> Path:
-        self._model_dir.mkdir(parents=True, exist_ok=True)
-        target_path = self._model_dir / self.DEFAULT_MODEL_FILENAME
-        lock_path = self._model_dir / f"{self.DEFAULT_MODEL_FILENAME}.lock"
-        partial_path = self._model_dir / f"{self.DEFAULT_MODEL_FILENAME}.part"
-
-        lock_fd = self._acquire_download_lock(lock_path, target_path)
-        if lock_fd is None:
-            return target_path
-
-        try:
-            if target_path.exists():
-                return target_path
-            if partial_path.exists():
-                partial_path.unlink()
-            print(
-                f"正在从 Hugging Face 下载默认模型 {self.DEFAULT_MODEL_REPO}/"
-                f"{self.DEFAULT_MODEL_FILENAME} ...",
-                file=sys.stderr,
-                flush=True,
-            )
-            with urllib.request.urlopen(self.DEFAULT_MODEL_URL, timeout=60) as response:
-                with partial_path.open("wb") as file:
-                    shutil.copyfileobj(response, file, length=1024 * 1024)
-            partial_path.replace(target_path)
-            return target_path
-        except Exception:
-            if partial_path.exists():
-                partial_path.unlink()
-            raise
-        finally:
-            os.close(lock_fd)
-            try:
-                lock_path.unlink()
-            except FileNotFoundError:
-                pass
-
-    @staticmethod
-    def _acquire_download_lock(lock_path: Path, target_path: Path) -> int | None:
-        deadline = time.monotonic() + 3600
-        while True:
-            if target_path.exists():
-                return None
-            try:
-                return os.open(lock_path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
-            except FileExistsError:
-                if time.monotonic() >= deadline:
-                    raise RuntimeError("等待默认模型下载超时。")
-                time.sleep(1)
-
-    @staticmethod
-    def _build_prompt(entry: WordEntry, scope: str = "") -> str:
-        forms = f"\nWord forms: {entry.forms}" if entry.forms else ""
-        scope_text = LocalLlmExampleGenerator._build_scope_text(scope)
-        meaning_text = entry.meaning or "(empty)"
-        meaning_requirement = (
-            "- The Chinese meaning is empty; provide a concise Chinese vocabulary meaning in the meaning field.\n"
-            if not entry.meaning
-            else "- Do not change, validate, or repeat the Chinese meaning field.\n"
-        )
-        json_shape = (
-            '{"example_sentence": "...", "example_sentence_cn": "...", "meaning": "..."}'
-            if not entry.meaning
-            else '{"example_sentence": "...", "example_sentence_cn": "..."}'
-        )
-        return (
-            "Generate one natural, short English sentence for this vocabulary word, "
-            "and provide a fluent Chinese translation.\n"
-            f"{scope_text}"
-            f"Word: {entry.word}\n"
-            f"Chinese meaning: {meaning_text}"
-            f"{forms}\n"
-            "Requirements:\n"
-            "- The English sentence must include the word or a common form of it.\n"
-            "- Interpret the word according to the scope above when choosing meanings and translations.\n"
-            f"{meaning_requirement}"
-            "- Keep the sentence under 16 English words.\n"
-            "- Do not explain anything.\n"
-            f"Return JSON exactly like: {json_shape}"
+    def _model_status_from_payload(data: dict[str, Any]) -> ModelStatus:
+        path = data.get("path")
+        return ModelStatus(
+            path=Path(path) if path else None,
+            is_user_model=bool(data.get("is_user_model", False)),
+            downloaded=bool(data.get("downloaded", False)),
         )
 
     @staticmethod
-    def _build_correction_prompt(entry: WordEntry, scope: str = "") -> str:
-        normalized_word = LocalLlmExampleGenerator._normalize_english_term(entry.word)
-        scope_text = LocalLlmExampleGenerator._build_scope_text(scope)
-        return (
-            "Correct this vocabulary record.\n"
-            f"{scope_text}"
-            f"Original English: {entry.word}\n"
-            f"Normalized English candidate: {normalized_word}\n"
-            "Requirements:\n"
-            "- Fix English formatting errors such as underscores used as spaces.\n"
-            "- If the original English contains underscores, replace them with spaces, not hyphens.\n"
-            "- Keep proper compounds/hyphenation only when standard English requires them.\n"
-            "- Do not correct, translate, validate, or comment on the Chinese meaning.\n"
-            "- Do not correct, validate, or comment on word forms.\n"
-            "- Do not explain anything outside JSON.\n"
-            'Return JSON exactly like: {"corrected_word": "...", "note": "..."}'
+    def _device_status_from_payload(data: dict[str, Any]) -> DeviceStatus:
+        selected = data.get("selected")
+        supported = data.get("gpu_offload_supported")
+        return DeviceStatus(
+            requested=str(data.get("requested", "")),
+            detected=str(data.get("detected", "")),
+            selected=str(selected) if selected is not None else None,
+            gpu_offload_supported=bool(supported) if supported is not None else None,
+            error=str(data.get("error", "")),
         )
-
-    @staticmethod
-    def _build_explanation_prompt(entry: WordEntry, scope: str = "", language: str = "") -> str:
-        scope_text = LocalLlmExampleGenerator._build_scope_text(scope)
-        language_text = language.strip() or "Infer from the word or phrase and the vocabulary table."
-        return (
-            "Explain the target-language usage of this vocabulary item for a Chinese learner.\n"
-            f"Target vocabulary language: {language_text}\n"
-            f"{scope_text}"
-            f"Word or phrase: {entry.word}\n"
-            f"Chinese meaning in the app, for reference only: {entry.meaning or '(empty)'}\n"
-            f"Word forms: {entry.forms or '(empty)'}\n"
-            f"Example sentence: {entry.example_sentence or '(empty)'}\n"
-            f"Example Chinese translation: {entry.example_sentence_cn or '(empty)'}\n"
-            "Requirements:\n"
-            "- Write in Simplified Chinese.\n"
-            "- Keep it concise but useful.\n"
-            "- Explain how the word or phrase is used in its target language: core sense, grammar role, common collocations, register, and nuance.\n"
-            "- If an example sentence is provided, explain the target-language usage in that sentence.\n"
-            "- Do not explain how the Chinese translation is used in Chinese.\n"
-            "- Do not treat the Chinese meaning as the target word; it is only a reference to disambiguate the vocabulary item.\n"
-            "- Do not invent a different headword.\n"
-            'Return JSON exactly like: {"explanation": "..."}'
-        )
-
-    @staticmethod
-    def _build_scope_text(scope: str) -> str:
-        cleaned = scope.strip()
-        if not cleaned:
-            return ""
-        return (
-            f"Scope/domain: {cleaned}\n"
-            "Use this scope to resolve ambiguous English terms. "
-            "For example, decide whether an English term should stay hyphenated, "
-            "spaced, or joined based on this scope.\n"
-        )
-
-    @staticmethod
-    def _normalize_english_term(text: str) -> str:
-        normalized = re.sub(r"[_]+", " ", text.strip())
-        normalized = re.sub(r"\s+", " ", normalized)
-        return normalized
-
-    @staticmethod
-    def _parse_response(content: str, require_meaning: bool = False) -> GeneratedExample:
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-            cleaned = re.sub(r"```$", "", cleaned).strip()
-
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if match:
-            cleaned = match.group(0)
-
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f"模型返回内容不是有效 JSON：{content}") from error
-
-        example_sentence = str(data.get("example_sentence", "")).strip()
-        example_sentence_cn = str(data.get("example_sentence_cn", "")).strip()
-        meaning = str(data.get("meaning", "")).strip()
-        if not example_sentence or not example_sentence_cn:
-            raise RuntimeError(f"模型返回缺少例句字段：{content}")
-        if require_meaning and not meaning:
-            raise RuntimeError(f"模型返回缺少中文释义字段：{content}")
-
-        return GeneratedExample(
-            example_sentence=example_sentence,
-            example_sentence_cn=example_sentence_cn,
-            meaning=meaning,
-        )
-
-    @staticmethod
-    def _parse_correction_response(
-        content: str,
-        original: WordEntry,
-    ) -> GeneratedCorrection:
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-            cleaned = re.sub(r"```$", "", cleaned).strip()
-
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if match:
-            cleaned = match.group(0)
-
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f"模型返回内容不是有效 JSON：{content}") from error
-
-        corrected_word = str(data.get("corrected_word", "")).strip()
-        note = str(data.get("note", "")).strip()
-        normalized_word = LocalLlmExampleGenerator._normalize_english_term(original.word)
-        if "_" in original.word:
-            corrected_word = normalized_word
-        if not corrected_word:
-            corrected_word = normalized_word
-
-        return GeneratedCorrection(
-            corrected_word=corrected_word,
-            note=note,
-        )
-
-    @staticmethod
-    def _parse_explanation_response(content: str) -> GeneratedExplanation:
-        cleaned = content.strip()
-        if cleaned.startswith("```"):
-            cleaned = re.sub(r"^```(?:json)?", "", cleaned, flags=re.IGNORECASE).strip()
-            cleaned = re.sub(r"```$", "", cleaned).strip()
-
-        match = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
-        if match:
-            cleaned = match.group(0)
-
-        try:
-            data = json.loads(cleaned)
-        except json.JSONDecodeError as error:
-            raise RuntimeError(f"模型返回内容不是有效 JSON：{content}") from error
-
-        explanation = str(data.get("explanation", "")).strip()
-        if not explanation:
-            raise RuntimeError(f"模型返回缺少解释字段：{content}")
-        return GeneratedExplanation(explanation=explanation)
 
 
 def _main() -> None:
-    payload = json.loads(sys.stdin.read())
-    entry_data = payload["entry"]
-    entry = WordEntry(
-        word=entry_data["word"],
-        meaning=entry_data["meaning"],
-        source_index=int(entry_data.get("source_index", 0)),
-        frequency=int(entry_data.get("frequency", 0)),
-        forms=str(entry_data.get("forms", "")),
-        example_sentence=str(entry_data.get("example_sentence", "")),
-        example_sentence_cn=str(entry_data.get("example_sentence_cn", "")),
-    )
-    generator = LocalLlmExampleGenerator(Path(payload["model_dir"]))
-    action = payload["action"]
-    scope = str(payload.get("scope", ""))
-    language = str(payload.get("language", ""))
-    if action == "generate":
-        generated = generator.generate(entry, scope)
-        result = {
-            "example_sentence": generated.example_sentence,
-            "example_sentence_cn": generated.example_sentence_cn,
-        }
-        if generated.meaning:
-            result["meaning"] = generated.meaning
-    elif action == "correct":
-        corrected = generator.correct_entry(entry, scope)
-        result = {
-            "corrected_word": corrected.corrected_word,
-            "note": corrected.note,
-        }
-    elif action == "explain":
-        explained = generator.explain_entry(entry, scope, language)
-        result = {"explanation": explained.explanation}
-    elif action == "smoke_test":
-        generator._run_smoke_test()
-        result = {"ok": True}
-    else:
-        raise RuntimeError(f"未知智能任务：{action}")
-    print(json.dumps(result, ensure_ascii=False), flush=True)
+    try:
+        payload = json.loads(sys.stdin.read())
+        entry = LocalLlmExampleGenerator._entry_from_payload(payload["entry"])
+        generator = LocalLlmExampleGenerator(Path(str(payload.get("model_dir", "model"))))
+        result = generator._rpc(
+            "run_action",
+            {
+                "action": str(payload["action"]),
+                "entry": LocalLlmExampleGenerator._entry_payload(entry),
+                "scope": str(payload.get("scope", "")),
+                "language": str(payload.get("language", "")),
+            },
+        )
+        message = {"type": "result", "data": result}
+    except Exception as error:
+        message = {"type": "error", "error": str(error)}
+    print(json.dumps(message, ensure_ascii=False), flush=True)
 
 
 if __name__ == "__main__":

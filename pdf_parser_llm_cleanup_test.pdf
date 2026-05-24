@@ -1,0 +1,160 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [4 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+4 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 612 792] /Resources << /Font << /F1 3 0 R >> >> /Contents 5 0 R >>
+endobj
+5 0 obj
+<< /Length 3873 >>
+stream
+BT
+/F1 18 Tf
+1 0 0 1 72 720 Tm
+(PDF Parser LLM Cleanup Test) Tj
+/F1 10 Tf
+1 0 0 1 72 705 Tm
+() Tj
+/F1 10 Tf
+1 0 0 1 72 695 Tm
+(Purpose) Tj
+/F1 10 Tf
+1 0 0 1 72 680 Tm
+(This English document tests deterministic PDF extraction and LLM cleanup of noisy vocabulary candidates.) Tj
+/F1 10 Tf
+1 0 0 1 72 665 Tm
+(The ideal CSV should keep real vocabulary terms and remove names, variable names, code identifiers, file names, IDs, and URLs.) Tj
+/F1 10 Tf
+1 0 0 1 72 650 Tm
+() Tj
+/F1 10 Tf
+1 0 0 1 72 640 Tm
+(Target Vocabulary Section) Tj
+/F1 10 Tf
+1 0 0 1 72 625 Tm
+(machine learning machine learning machine learning machine learning) Tj
+/F1 10 Tf
+1 0 0 1 72 610 Tm
+(parser parser parser parser extraction extraction extraction extraction) Tj
+/F1 10 Tf
+1 0 0 1 72 595 Tm
+(token token token corpus corpus corpus embedding embedding embedding) Tj
+/F1 10 Tf
+1 0 0 1 72 580 Tm
+(vector vector vector matrix matrix matrix gradient gradient gradient) Tj
+/F1 10 Tf
+1 0 0 1 72 565 Tm
+(inference inference inference retrieval retrieval retrieval) Tj
+/F1 10 Tf
+1 0 0 1 72 550 Tm
+(pipeline pipeline normalization normalization architecture architecture) Tj
+/F1 10 Tf
+1 0 0 1 72 535 Tm
+(repository repository aggregate aggregate adapter adapter service service domain domain) Tj
+/F1 10 Tf
+1 0 0 1 72 520 Tm
+(translation translation alignment alignment frequency frequency vocabulary vocabulary) Tj
+/F1 10 Tf
+1 0 0 1 72 505 Tm
+() Tj
+/F1 10 Tf
+1 0 0 1 72 495 Tm
+(Inflected Forms Section) Tj
+/F1 10 Tf
+1 0 0 1 72 480 Tm
+(The system uses tools, used tools, and is using tools during tests.) Tj
+/F1 10 Tf
+1 0 0 1 72 465 Tm
+(The parser parses documents and parsed documents before the final parse.) Tj
+/F1 10 Tf
+1 0 0 1 72 450 Tm
+(The pipeline normalizes text, normalized text, and is normalizing text repeatedly.) Tj
+/F1 10 Tf
+1 0 0 1 72 435 Tm
+() Tj
+/F1 10 Tf
+1 0 0 1 72 425 Tm
+(Named Entity And Term Disambiguation Section) Tj
+/F1 10 Tf
+1 0 0 1 72 410 Tm
+(Li Hua generated a file named "wordApp," which mentions Bayes' theorem.) Tj
+/F1 10 Tf
+1 0 0 1 72 395 Tm
+(The ideal cleanup removes Li, Hua, Li Hua, and wordApp, but keeps Bayes' theorem as a technical term.) Tj
+/F1 10 Tf
+1 0 0 1 72 380 Tm
+() Tj
+/F1 10 Tf
+1 0 0 1 72 370 Tm
+(Noise Section: People Names That Should Be Removed) Tj
+/F1 10 Tf
+1 0 0 1 72 355 Tm
+(Alice Johnson met Bob Smith near John Williams and Mary Brown.) Tj
+/F1 10 Tf
+1 0 0 1 72 340 Tm
+(Dr. Emily Davis emailed Michael Wilson, Sarah Miller, David Moore, and Laura Taylor.) Tj
+/F1 10 Tf
+1 0 0 1 72 325 Tm
+(The names Alice, Bob, John, Mary, Emily, Michael, Sarah, David, and Laura are not vocabulary targets.) Tj
+/F1 10 Tf
+1 0 0 1 72 310 Tm
+() Tj
+/F1 10 Tf
+1 0 0 1 72 300 Tm
+(Noise Section: Variables, Functions, Classes, And Constants That Should Be Removed) Tj
+/F1 10 Tf
+1 0 0 1 72 285 Tm
+(tempScore maxRetries userID sessionToken rawTextBuffer parsedHTMLNode HTTPRequestHandler JSONParserFactory) Tj
+/F1 10 Tf
+1 0 0 1 72 270 Tm
+(calculateScore updateUserProfile parsePDFPage normalize_text cleanVocabularyCandidates VECTOR_SIZE MATRIX_ROWS) Tj
+/F1 10 Tf
+1 0 0 1 72 255 Tm
+(file_path output_csv debugFlag isReady hasError retry_count batch_id request_id) Tj
+/F1 10 Tf
+1 0 0 1 72 240 Tm
+() Tj
+/F1 10 Tf
+1 0 0 1 72 230 Tm
+(Noise Section: Files, Paths, URLs, And IDs That Should Be Removed) Tj
+/F1 10 Tf
+1 0 0 1 72 215 Tm
+(C:/Users/alice/project/input_report_v2.pdf ./runtime/cache/tmp_42.csv https://example.com/report?id=ABC123) Tj
+/F1 10 Tf
+1 0 0 1 72 200 Tm
+(commit a1b2c3d4 ticket WORD-942 build_2026_05_24 model-v1.2.3) Tj
+/F1 10 Tf
+1 0 0 1 72 185 Tm
+() Tj
+/F1 10 Tf
+1 0 0 1 72 175 Tm
+(Validation Notes) Tj
+/F1 10 Tf
+1 0 0 1 72 160 Tm
+(A non-LLM extraction pass may include some noisy candidates from the noise sections.) Tj
+/F1 10 Tf
+1 0 0 1 72 145 Tm
+(The LLM cleanup pass should remove those noisy candidates while preserving the target vocabulary terms above.) Tj
+ET
+endstream
+endobj
+xref
+0 6
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000191 00000 n 
+0000000317 00000 n 
+trailer
+<< /Size 6 /Root 1 0 R >>
+startxref
+4242
+%%EOF

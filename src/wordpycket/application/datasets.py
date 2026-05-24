@@ -51,7 +51,7 @@ class VocabularyCleaner(Protocol):
     ) -> list[WordEntry]: ...
 
 
-PdfVocabularyBuilder = Callable[[Path, Path, VocabularyCleaner | None, ProgressCallback | None], None]
+PdfVocabularyBuilder = Callable[[Path, Path, VocabularyCleaner | None, ProgressCallback | None], object]
 
 
 class DatasetService:
@@ -74,15 +74,32 @@ class DatasetService:
         self._vocabulary_cleaner = vocabulary_cleaner
 
     def activate_csv(self, csv_path: Path) -> DatasetResult:
+        return self._activate_csv(csv_path)
+
+    def _activate_csv(
+        self,
+        csv_path: Path,
+        progress_callback: ProgressCallback | None = None,
+    ) -> DatasetResult:
         csv_path = csv_path.resolve()
         if not csv_path.exists():
             self._csv_library.cleanup_orphan_databases()
             raise FileNotFoundError(f"CSV 不存在：{csv_path}")
+        if progress_callback is not None:
+            progress_callback("读取生成的 CSV", 93)
         result = self._csv_loader(csv_path)
+        if progress_callback is not None:
+            progress_callback("准备词库数据库", 94)
         self._word_service.use_repository(self._repository_factory(self._csv_library.database_path(csv_path)))
+        if progress_callback is not None:
+            progress_callback(f"写入词库数据库：0/{len(result.entries)}", 95)
         imported_count = self._word_service.import_words(result.entries)
+        if progress_callback is not None:
+            progress_callback(f"写入词库数据库：{imported_count}/{len(result.entries)}", 98)
         self._csv_library.set_active_csv(csv_path)
         self._csv_library.cleanup_orphan_databases()
+        if progress_callback is not None:
+            progress_callback("词库切换完成", 100)
         return DatasetResult(result.language, csv_path, imported_count)
 
     def upload_csv(self, source_path: Path) -> DatasetResult:
@@ -103,10 +120,14 @@ class DatasetService:
         vocabulary_cleaner = self._vocabulary_cleaner if use_llm_cleanup else None
         if progress_callback is not None:
             progress_callback("准备解析 PDF", 1)
-        self._pdf_builder(pdf_path, target_path, vocabulary_cleaner, progress_callback)
+        build_result = self._pdf_builder(pdf_path, target_path, vocabulary_cleaner, progress_callback)
         if progress_callback is not None:
             progress_callback("导入 CSV 到数据库", 92)
-        return self.activate_csv(target_path)
+        result = self._activate_csv(target_path, progress_callback)
+        detected_language = getattr(build_result, "language", "")
+        if detected_language:
+            return DatasetResult(detected_language, result.csv_path, result.imported_count)
+        return result
 
     def delete_csv(self, csv_path: Path) -> DatasetResult | None:
         self._csv_library.delete_csv(csv_path)

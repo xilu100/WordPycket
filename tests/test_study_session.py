@@ -147,7 +147,7 @@ def test_word_moves_from_learning_to_review_after_five_known_marks() -> None:
 
 
 def test_review_word_becomes_learned_only_after_delay_expires() -> None:
-    reviewed_at = datetime(2026, 5, 23, 10, 0, 0)
+    reviewed_at = datetime.now()
     entry = WordEntry(word="kernel", meaning="内核", correct_count=5)
 
     entry = entry.mark_known(reviewed_at=reviewed_at)

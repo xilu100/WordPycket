@@ -66,8 +66,8 @@ data/
 - 上传 CSV 会先校验列名，通过后复制到 `input/` 并切换到该 CSV。上传 PDF 会自动解析并在 `input/` 中生成一个 CSV。
 - 每个 CSV 使用独立 SQLite 数据库保存学习进度和例句；切换 CSV 不会丢失其它 CSV 的数据库。删除 CSV 前会提示确认，确认后对应数据库会一起删除。
 - CSV 会自动检测列名语言，但列结构必须是固定的 5 列。例如英语是 `Index`、`English`、`Chinese`、`Frequency`、`Forms`；德语是 `Index`、`Deutsch`、`Chinesisch`、`Häufigkeit`、`Formen`。
-- 上传 PDF 会提取文本、自动识别语言、统计词频和固定词组频率，并生成同一套固定列结构的 CSV。扫描图片 PDF 需要先 OCR 成可复制文本。
-- PDF 词形归并强制使用语言库：英文需要 `nltk` 的 `wordnet` 数据，其它拉丁字母语言需要对应 spaCy 模型；缺少语言库时会提示安装。
+- 上传 PDF 会提取文本、使用确定性的多语言频率引擎清洗文本、识别语言、统计 lemma 频率和词形，并生成固定列结构 `Index,English,Chinese,Frequency,Forms` 的粗制 CSV。扫描图片 PDF 需要先 OCR 成可复制文本。
+- PDF 上传时会询问是否使用本地 LLM 审阅粗制 CSV；选择“是”会使用或下载 `model/` 中的默认 `.gguf` 模型来删除不是单词或词组的条目，选择“否”则直接使用无 LLM 的粗制 CSV。PDF 基础转换不使用外部 API 或 transformer pipeline。
 - SQLite 保存词条、例句、会/不会次数、复习时间和学习状态。
 - 正常启动会按 CSV 更新单词释义、频率和词形，不会清空已有例句或学习进度。
 - `重置学习进度` 会保留 `Index`、英文、中文、频率、词形、例句和例句中文；其它学习进度字段会清零。

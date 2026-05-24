@@ -10,7 +10,7 @@ from pathlib import Path
 import pytest
 
 from wordpycket.domain.entities import WordEntry
-from wordpycket.infrastructure.example_generator import LocalLlmExampleGenerator
+from llmserver.engine import LocalLlmExampleGenerator
 
 
 class UrlOpenResponse(BytesIO):
@@ -106,7 +106,11 @@ def test_explanation_prompt_targets_vocabulary_language_not_chinese_translation(
     )
 
     assert "Target vocabulary language: 德语" in prompt
-    assert "target-language usage" in prompt
+    assert "exactly three labeled sections: 意思, 常规用法, 领域用法" in prompt
+    assert "In 意思, give the meaning of the target word or phrase itself" in prompt
+    assert "In 常规用法, explain ordinary target-language usage" in prompt
+    assert "In 领域用法, explain how the target word or phrase is used in the required domain/scope" in prompt
+    assert "Required domain for domain-specific usage: 医学" in prompt
     assert "Do not explain how the Chinese translation is used in Chinese" in prompt
     assert "only a reference to disambiguate the vocabulary item" in prompt
 
@@ -364,6 +368,36 @@ def test_pdf_vocabulary_cleaner_removes_model_selected_indexes(
     assert [entry.source_index for entry in cleaned] == [1, 2]
 
 
+def test_pdf_vocabulary_cleaner_keeps_rows_when_one_batch_fails(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    generator = LocalLlmExampleGenerator(Path("model"))
+    entries = [
+        WordEntry(source_index=1, word="vector", meaning="", frequency=4),
+        WordEntry(source_index=2, word="noise", meaning="", frequency=2),
+        WordEntry(source_index=3, word="matrix", meaning="", frequency=1),
+    ]
+    monkeypatch.setattr(generator, "_parallel_workers", lambda: 2)
+    monkeypatch.setattr(generator, "_pdf_clean_batches", lambda _entries: [entries[:2], entries[2:]])
+
+    def clean_batch(_slots, batch, _language):
+        if batch[0].word == "vector":
+            raise RuntimeError("simulated LLM failure")
+        return set()
+
+    monkeypatch.setattr(generator, "_clean_pdf_batch_with_slot", clean_batch)
+    progress = []
+
+    cleaned = generator.clean_pdf_vocabulary_entries(
+        entries,
+        "英语",
+        progress_callback=lambda message, percent: progress.append((message, percent)),
+    )
+
+    assert [entry.word for entry in cleaned] == ["vector", "noise", "matrix"]
+    assert progress[-1] == ("AI 审阅 CSV 完成，1 批失败并已保留", 80)
+
+
 def test_pdf_vocabulary_cleaner_accepts_batch_row_numbers() -> None:
     batch = [
         WordEntry(source_index=101, word="machine learning", meaning="", frequency=4),
@@ -405,8 +439,8 @@ def test_llm_auto_tuning_scales_with_available_cuda_memory(
         "_detect_accelerator",
         classmethod(lambda cls: cls._CUDA_DEVICE),
     )
-    monkeypatch.setattr(LocalLlmExampleGenerator, "_cuda_free_vram_mb", staticmethod(lambda: 12000))
-    monkeypatch.setattr(LocalLlmExampleGenerator, "_system_memory_mb", staticmethod(lambda: 32000))
+    monkeypatch.setattr(LocalLlmExampleGenerator, "_cuda_capacity_mb", classmethod(lambda cls: 12000))
+    monkeypatch.setattr(LocalLlmExampleGenerator, "_system_capacity_mb", classmethod(lambda cls: 32000))
 
     assert LocalLlmExampleGenerator._context_size() == 16384
     assert LocalLlmExampleGenerator._pdf_clean_batch_size() == 100
