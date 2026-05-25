@@ -65,6 +65,33 @@ def test_llm_job_poller_normalizes_explain_statuses() -> None:
     assert poller.is_idle()
 
 
+def test_llm_job_poller_formats_explain_section_object() -> None:
+    entry = WordEntry(word="token", meaning="标记")
+    generator = FakeGenerator(
+        [
+            {
+                "state": "completed",
+                "result": {
+                    "explanation": {
+                        "意思": "标记",
+                        "常规用法": "表示一个独立单位。",
+                        "领域用法": "在 AI 中表示基本处理单元。",
+                    }
+                },
+            }
+        ]
+    )
+    poller = LlmJobPoller(generator)
+    poller.submit_explain(entry, "", "")
+
+    event = poller.poll_explain()
+
+    assert event == ExplainCompleted(
+        entry,
+        "意思：标记\n常规用法：表示一个独立单位。\n领域用法：在 AI 中表示基本处理单元。",
+    )
+
+
 def test_llm_job_poller_returns_failed_event_for_invalid_explain_result() -> None:
     generator = FakeGenerator([{"state": "completed", "result": []}])
     poller = LlmJobPoller(generator)
@@ -102,3 +129,18 @@ def test_llm_job_poller_pops_completed_batch_jobs() -> None:
         "example_sentence_cn": "向量会旋转。",
     }
     assert not poller.has_batch_jobs()
+
+
+def test_llm_job_poller_submits_supplement_batch_job() -> None:
+    generator = FakeGenerator()
+    poller = LlmJobPoller(generator)
+    entries = [
+        WordEntry(word="vector", meaning="向量", source_index=1),
+        WordEntry(word="matrix", meaning="矩阵", source_index=2),
+    ]
+
+    poller.submit_supplement_batch_job(entries, "AI")
+
+    assert generator.submissions[0][0] == "run_action"
+    assert generator.submissions[0][1]["action"] == "generate_batch"
+    assert [item["word"] for item in generator.submissions[0][1]["entries"]] == ["vector", "matrix"]

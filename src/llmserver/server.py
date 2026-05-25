@@ -190,6 +190,18 @@ class LlmRpcHandler(BaseHTTPRequestHandler):
         if method == "generate":
             entry = _entry_from_payload(params["entry"])
             return self.generator._generate_with_slot(slot, entry, str(params.get("scope", "")))[1]
+        if method == "generate_batch":
+            entries = [_entry_from_payload(item) for item in params.get("entries", [])]
+            generated = self.generator._generate_batch_with_slot(0, entries, str(params.get("scope", "")))
+            return [
+                {
+                    "entry": _entry_to_payload(item_entry),
+                    "example_sentence": example.example_sentence,
+                    "example_sentence_cn": example.example_sentence_cn,
+                    "meaning": example.meaning,
+                }
+                for item_entry, example in generated
+            ]
         if method == "correct_entry":
             entry = _entry_from_payload(params["entry"])
             return self.generator._correct_with_slot(slot, entry, str(params.get("scope", "")))[1]
@@ -216,6 +228,8 @@ class LlmRpcHandler(BaseHTTPRequestHandler):
             return self.generator.check_model_runtime()
         if method == "recommended_process_parallelism":
             return self.generator.recommended_process_parallelism()
+        if method == "recommended_supplement_strategy":
+            return self.generator.recommended_supplement_strategy()
         if method == "clean_pdf_vocabulary_entries":
             entries = [_entry_from_payload(item) for item in params.get("entries", [])]
             cleaned = self.generator.clean_pdf_vocabulary_entries(
@@ -228,9 +242,23 @@ class LlmRpcHandler(BaseHTTPRequestHandler):
 
     def _run_action(self, params: dict[str, Any], slot: int = 0) -> dict[str, Any]:
         action = str(params.get("action", ""))
-        entry = _entry_from_payload(params["entry"])
         scope = str(params.get("scope", ""))
         language = str(params.get("language", ""))
+        if action == "generate_batch":
+            entries = [_entry_from_payload(item) for item in params.get("entries", [])]
+            generated = self.generator._generate_batch_with_slot(0, entries, scope)
+            return {
+                "items": [
+                    {
+                        "entry": _entry_to_payload(item_entry),
+                        "example_sentence": example.example_sentence,
+                        "example_sentence_cn": example.example_sentence_cn,
+                        "meaning": example.meaning,
+                    }
+                    for item_entry, example in generated
+                ]
+            }
+        entry = _entry_from_payload(params["entry"])
         if action == "generate":
             generated = self.generator._generate_with_slot(slot, entry, scope)[1]
             result = {
@@ -260,7 +288,7 @@ def main() -> None:
     args = parser.parse_args()
 
     LlmRpcHandler.generator = LocalLlmExampleGenerator(Path(args.model_dir))
-    LlmRpcHandler.jobs = JobStore(LlmRpcHandler.generator._parallel_workers())
+    LlmRpcHandler.jobs = JobStore(LlmRpcHandler.generator.recommended_process_parallelism())
     server = ThreadingHTTPServer((args.host, args.port), LlmRpcHandler)
     status = LlmRpcHandler.generator.model_status()
     print(

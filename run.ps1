@@ -13,6 +13,9 @@ $PythonVersion = "3.11"
 $VenvPath = Join-Path $Root ".venv"
 $VenvPython = Join-Path $VenvPath "Scripts\python.exe"
 $SetupMarker = Join-Path $RuntimeDir ".setup-complete"
+$SetupScript = Join-Path $Root "scripts\setup_env.py"
+$CheckScript = Join-Path $Root "scripts\check_env.py"
+$PyprojectFile = Join-Path $Root "pyproject.toml"
 
 $TranscriptStarted = $false
 $ExitCode = 0
@@ -77,10 +80,32 @@ function Get-VenvPythonVersion {
     return (& $VenvPython -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')").Trim()
 }
 
+function Get-SetupFingerprint {
+    $Parts = @("python=$PythonVersion", "setup=2")
+    foreach ($Path in @($PyprojectFile, $SetupScript, $CheckScript)) {
+        if (Test-Path $Path) {
+            $Hash = (Get-FileHash -Algorithm SHA256 -Path $Path).Hash
+            $Parts += "$([IO.Path]::GetFileName($Path))=$Hash"
+        } else {
+            $Parts += "$([IO.Path]::GetFileName($Path))=missing"
+        }
+    }
+    return ($Parts -join "`n")
+}
+
+function Test-SetupMarker {
+    param([Parameter(Mandatory = $true)][string] $Expected)
+    if (-not (Test-Path $SetupMarker)) {
+        return $false
+    }
+    return ((Get-Content -Raw -Path $SetupMarker) -eq $Expected)
+}
+
 Install-LocalUv
 Install-LocalPython
 
-$NeedsSetup = -not (Test-Path $SetupMarker)
+$SetupFingerprint = Get-SetupFingerprint
+$NeedsSetup = -not (Test-SetupMarker $SetupFingerprint)
 $ExistingPythonVersion = Get-VenvPythonVersion
 if (($null -ne $ExistingPythonVersion) -and ($ExistingPythonVersion -ne $PythonVersion)) {
     Write-Host "Existing virtual environment uses Python $ExistingPythonVersion; recreating with Python $PythonVersion."
@@ -95,8 +120,15 @@ if (-not (Test-Path $VenvPython)) {
 }
 
 if ($NeedsSetup) {
-    Invoke-NativeChecked $VenvPython (Join-Path $Root "scripts\setup_env.py") "--strict-accel"
-    New-Item -ItemType File -Force -Path $SetupMarker | Out-Null
+    Invoke-NativeChecked $VenvPython $SetupScript "--strict-accel"
+    Set-Content -Path $SetupMarker -Value $SetupFingerprint -NoNewline
+} else {
+    & $VenvPython $CheckScript
+    if ($LASTEXITCODE -ne 0) {
+        Write-Host "Environment check found missing or outdated components; repairing environment."
+        Invoke-NativeChecked $VenvPython $SetupScript "--strict-accel"
+        Set-Content -Path $SetupMarker -Value $SetupFingerprint -NoNewline
+    }
 }
 
 Invoke-NativeChecked $VenvPython "-m" "wordpycket.main"
@@ -106,7 +138,7 @@ Invoke-NativeChecked $VenvPython "-m" "wordpycket.main"
     Write-Host "WordPycket failed to start."
     Write-Host "Startup log saved to: $LogFile"
     Write-Host ""
-    Write-Error $_
+    Write-Error ($_ | Format-List * -Force | Out-String)
 } finally {
     if ($TranscriptStarted) {
         Stop-Transcript | Out-Null

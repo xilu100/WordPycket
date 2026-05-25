@@ -13,6 +13,9 @@ PYTHON_VERSION="3.11"
 VENV_PATH="$ROOT/.venv"
 VENV_PYTHON="$VENV_PATH/bin/python"
 SETUP_MARKER="$RUNTIME_DIR/.setup-complete"
+SETUP_SCRIPT="$ROOT/scripts/setup_env.py"
+CHECK_SCRIPT="$ROOT/scripts/check_env.py"
+PYPROJECT_FILE="$ROOT/pyproject.toml"
 
 mkdir -p "$LOG_DIR"
 exec > >(tee -a "$LOG_FILE") 2>&1
@@ -73,10 +76,39 @@ get_venv_python_version() {
     "$VENV_PYTHON" -c "import sys; print(f'{sys.version_info.major}.{sys.version_info.minor}')"
 }
 
+file_hash() {
+    if command -v shasum >/dev/null 2>&1; then
+        shasum -a 256 "$1" | awk '{print $1}'
+    else
+        openssl dgst -sha256 "$1" | awk '{print $NF}'
+    fi
+}
+
+setup_fingerprint() {
+    printf 'python=%s\nsetup=2\n' "$PYTHON_VERSION"
+    for path in "$PYPROJECT_FILE" "$SETUP_SCRIPT" "$CHECK_SCRIPT"; do
+        name="$(basename "$path")"
+        if [ -f "$path" ]; then
+            printf '%s=%s\n' "$name" "$(file_hash "$path")"
+        else
+            printf '%s=missing\n' "$name"
+        fi
+    done
+}
+
+setup_marker_matches() {
+    expected="$1"
+    if [ ! -f "$SETUP_MARKER" ]; then
+        return 1
+    fi
+    [ "$(cat "$SETUP_MARKER")" = "$expected" ]
+}
+
 install_local_uv
 install_local_python
 
 needs_setup=0
+setup_hash="$(setup_fingerprint)"
 existing_python_version="$(get_venv_python_version || true)"
 if [ -n "$existing_python_version" ] && [ "$existing_python_version" != "$PYTHON_VERSION" ]; then
     echo "Existing virtual environment uses Python $existing_python_version; recreating with Python $PYTHON_VERSION."
@@ -90,13 +122,19 @@ if [ ! -x "$VENV_PYTHON" ]; then
     needs_setup=1
 fi
 
-if [ ! -f "$SETUP_MARKER" ]; then
+if ! setup_marker_matches "$setup_hash"; then
     needs_setup=1
 fi
 
 if [ "$needs_setup" -eq 1 ]; then
-    "$VENV_PYTHON" "$ROOT/scripts/setup_env.py"
-    touch "$SETUP_MARKER"
+    "$VENV_PYTHON" "$SETUP_SCRIPT" --strict-accel
+    printf '%s' "$setup_hash" > "$SETUP_MARKER"
+else
+    if ! "$VENV_PYTHON" "$CHECK_SCRIPT"; then
+        echo "Environment check found missing or outdated components; repairing environment."
+        "$VENV_PYTHON" "$SETUP_SCRIPT" --strict-accel
+        printf '%s' "$setup_hash" > "$SETUP_MARKER"
+    fi
 fi
 
 "$VENV_PYTHON" -m wordpycket.main

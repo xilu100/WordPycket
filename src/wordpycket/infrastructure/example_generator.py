@@ -68,8 +68,8 @@ class ModelCheckResult:
 class LocalLlmExampleGenerator:
     """HTTP client for the local llmserver process."""
 
-    DEFAULT_MODEL_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
-    DEFAULT_MODEL_FILENAME = "qwen2.5-3b-instruct-q4_k_m.gguf"
+    DEFAULT_MODEL_REPO = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+    DEFAULT_MODEL_FILENAME = "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
     DEFAULT_MODEL_URL = (
         f"https://huggingface.co/{DEFAULT_MODEL_REPO}/resolve/main/"
         f"{DEFAULT_MODEL_FILENAME}?download=true"
@@ -88,6 +88,7 @@ class LocalLlmExampleGenerator:
         self._local_jobs: dict[str, dict[str, Any]] = {}
         self._local_jobs_lock = threading.Lock()
         self._server_start_lock = threading.Lock()
+        self._recommended_process_parallelism: int | None = None
         self._owns_process = False
         atexit.register(self.close)
 
@@ -117,10 +118,30 @@ class LocalLlmExampleGenerator:
             "explain_entry",
             {"entry": self._entry_payload(entry), "scope": scope, "language": language},
         )
-        return GeneratedExplanation(explanation=str(data["explanation"]))
+        return GeneratedExplanation(explanation=self._format_explanation(data["explanation"]))
 
     def explain_entry_isolated(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExplanation:
         return self.explain_entry(entry, scope, language)
+
+    @staticmethod
+    def _format_explanation(value) -> str:
+        if isinstance(value, dict):
+            preferred_labels = ["意思", "常规用法", "领域用法"]
+            lines = []
+            used_labels = set()
+            for label in preferred_labels:
+                text = str(value.get(label, "")).strip()
+                if text:
+                    lines.append(f"{label}：{text}")
+                    used_labels.add(label)
+            for label, text_value in value.items():
+                if label in used_labels:
+                    continue
+                text = str(text_value).strip()
+                if text:
+                    lines.append(f"{label}：{text}")
+            return "\n".join(lines).strip()
+        return str(value).strip()
 
     def generate_many(
         self,
@@ -244,7 +265,44 @@ class LocalLlmExampleGenerator:
                 return max(1, min(8, int(override)))
             except ValueError as error:
                 raise RuntimeError("WORDPYCKET_LLM_PROCESS_PARALLEL 必须是整数。") from error
-        return int(self._rpc("recommended_process_parallelism"))
+        if self._recommended_process_parallelism is not None:
+            return self._recommended_process_parallelism
+
+        model_path = self._find_existing_model_path()
+        model_size_mb = self._model_size_mb(model_path)
+        memory_mb = self._system_capacity_mb()
+        cpu_count = os.cpu_count() or 1
+        accelerator = self._detect_accelerator()
+
+        if accelerator == self._MPS_DEVICE:
+            self._recommended_process_parallelism = 1
+            return self._recommended_process_parallelism
+
+        vram_mb = self._cuda_capacity_mb()
+        if vram_mb is not None:
+            vram_per_worker_mb = max(2600, int(model_size_mb * 0.65) + 900)
+            ram_per_worker_mb = max(2600, int(model_size_mb * 0.9) + 900)
+            vram_workers = max(1, vram_mb // vram_per_worker_mb)
+            ram_workers = max(1, memory_mb // ram_per_worker_mb)
+            self._recommended_process_parallelism = max(1, min(4, vram_workers, ram_workers))
+            return self._recommended_process_parallelism
+
+        per_worker_mb = max(3600, int(model_size_mb * 2.0) + 1400)
+        memory_workers = max(1, memory_mb // per_worker_mb)
+        cpu_budget = max(1, cpu_count - 2)
+        cpu_workers = max(1, cpu_budget // self._threads_per_model())
+        self._recommended_process_parallelism = max(1, min(2, memory_workers, cpu_workers))
+        return self._recommended_process_parallelism
+
+    def recommended_supplement_strategy(self) -> dict[str, Any]:
+        batch_size = self._recommended_batch_generate_size()
+        if batch_size > 1:
+            return {"mode": "batch", "parallelism": 1, "batch_size": batch_size}
+        return {
+            "mode": "parallel",
+            "parallelism": self.recommended_process_parallelism(),
+            "batch_size": 1,
+        }
 
     def clean_pdf_vocabulary_entries(
         self,
@@ -846,6 +904,7 @@ class LocalLlmExampleGenerator:
             "device_status",
             "check_model_runtime",
             "recommended_process_parallelism",
+            "recommended_supplement_strategy",
         }:
             return False
         if method == "run_action" and isinstance(params, dict) and params.get("action") == "smoke_test":
@@ -875,6 +934,168 @@ class LocalLlmExampleGenerator:
             names = "、".join(path.name for path in models)
             raise RuntimeError(f"model 目录中只能存在一个 .gguf 模型文件。当前存在：{names}")
         return models[0] if models else None
+
+    @staticmethod
+    def _model_size_mb(model_path: Path | None) -> int:
+        if model_path is None:
+            return 2048
+        return max(1, model_path.stat().st_size // (1024 * 1024))
+
+    def _recommended_batch_generate_size(self) -> int:
+        override = os.getenv("WORDPYCKET_LLM_BATCH_SIZE")
+        if override is not None:
+            try:
+                return max(1, min(32, int(override)))
+            except ValueError as error:
+                raise RuntimeError("WORDPYCKET_LLM_BATCH_SIZE 必须是整数。") from error
+
+        model_path = self._find_existing_model_path()
+        model_size_mb = self._model_size_mb(model_path)
+        vram_mb = self._cuda_capacity_mb()
+        if vram_mb is None:
+            return 1
+        single_instance_mb = max(2600, int(model_size_mb * 0.65) + 900)
+        if vram_mb < single_instance_mb * 5:
+            return 8
+        return 1
+
+    @staticmethod
+    def _threads_per_model() -> int:
+        cpu_count = os.cpu_count() or 1
+        if cpu_count <= 4:
+            return max(1, cpu_count - 1)
+        return min(3, cpu_count - 2)
+
+    @classmethod
+    def _cuda_capacity_mb(cls) -> int | None:
+        if os.getenv("CUDA_VISIBLE_DEVICES") == "-1":
+            return None
+        total_vram_mb = cls._cuda_total_vram_mb()
+        if total_vram_mb is not None:
+            return total_vram_mb
+        return cls._cuda_free_vram_mb()
+
+    @staticmethod
+    def _cuda_total_vram_mb() -> int | None:
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi is None:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    nvidia_smi,
+                    "--query-gpu=memory.total",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        values = [int(line.strip()) for line in result.stdout.splitlines() if line.strip().isdigit()]
+        return max(values) if values else None
+
+    @staticmethod
+    def _cuda_free_vram_mb() -> int | None:
+        nvidia_smi = shutil.which("nvidia-smi")
+        if nvidia_smi is None:
+            return None
+        try:
+            result = subprocess.run(
+                [
+                    nvidia_smi,
+                    "--query-gpu=memory.free",
+                    "--format=csv,noheader,nounits",
+                ],
+                capture_output=True,
+                check=False,
+                text=True,
+                timeout=3,
+            )
+        except (OSError, subprocess.TimeoutExpired):
+            return None
+        if result.returncode != 0:
+            return None
+        values = [int(line.strip()) for line in result.stdout.splitlines() if line.strip().isdigit()]
+        return max(values) if values else None
+
+    @classmethod
+    def _system_capacity_mb(cls) -> int:
+        return cls._system_total_memory_mb() or cls._system_memory_mb()
+
+    @staticmethod
+    def _system_total_memory_mb() -> int | None:
+        if platform.system() == "Windows":
+            try:
+                import ctypes
+
+                class MemoryStatus(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                status = MemoryStatus()
+                status.dwLength = ctypes.sizeof(status)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+                return max(1, status.ullTotalPhys // (1024 * 1024))
+            except Exception:
+                return None
+
+        if hasattr(os, "sysconf"):
+            try:
+                pages = os.sysconf("SC_PHYS_PAGES")
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                return max(1, (pages * page_size) // (1024 * 1024))
+            except (OSError, ValueError):
+                return None
+        return None
+
+    @staticmethod
+    def _system_memory_mb() -> int:
+        if platform.system() == "Windows":
+            try:
+                import ctypes
+
+                class MemoryStatus(ctypes.Structure):
+                    _fields_ = [
+                        ("dwLength", ctypes.c_ulong),
+                        ("dwMemoryLoad", ctypes.c_ulong),
+                        ("ullTotalPhys", ctypes.c_ulonglong),
+                        ("ullAvailPhys", ctypes.c_ulonglong),
+                        ("ullTotalPageFile", ctypes.c_ulonglong),
+                        ("ullAvailPageFile", ctypes.c_ulonglong),
+                        ("ullTotalVirtual", ctypes.c_ulonglong),
+                        ("ullAvailVirtual", ctypes.c_ulonglong),
+                        ("ullAvailExtendedVirtual", ctypes.c_ulonglong),
+                    ]
+
+                status = MemoryStatus()
+                status.dwLength = ctypes.sizeof(status)
+                ctypes.windll.kernel32.GlobalMemoryStatusEx(ctypes.byref(status))
+                return max(1, status.ullAvailPhys // (1024 * 1024))
+            except Exception:
+                return 4096
+
+        if hasattr(os, "sysconf"):
+            try:
+                pages = os.sysconf("SC_AVPHYS_PAGES")
+                page_size = os.sysconf("SC_PAGE_SIZE")
+                return max(1, (pages * page_size) // (1024 * 1024))
+            except (OSError, ValueError):
+                return 4096
+        return 4096
 
     @staticmethod
     def _request_timeout_seconds() -> int:

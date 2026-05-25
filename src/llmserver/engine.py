@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import logging
+import gc
 import os
 import platform
 import shutil
@@ -41,8 +42,8 @@ def _install_llama_cleanup_error_filter() -> None:
 _install_llama_cleanup_error_filter()
 
 class LocalLlmExampleGenerator:
-    DEFAULT_MODEL_REPO = "Qwen/Qwen2.5-3B-Instruct-GGUF"
-    DEFAULT_MODEL_FILENAME = "qwen2.5-3b-instruct-q4_k_m.gguf"
+    DEFAULT_MODEL_REPO = "Qwen/Qwen2.5-Coder-7B-Instruct-GGUF"
+    DEFAULT_MODEL_FILENAME = "qwen2.5-coder-7b-instruct-q4_k_m.gguf"
     DEFAULT_MODEL_URL = (
         f"https://huggingface.co/{DEFAULT_MODEL_REPO}/resolve/main/"
         f"{DEFAULT_MODEL_FILENAME}?download=true"
@@ -97,6 +98,7 @@ class LocalLlmExampleGenerator:
             llm,
             prompt,
             system_prompt="You explain target-language vocabulary usage for Chinese learners. Return only valid JSON.",
+            max_tokens=self._explanation_max_tokens(),
         )
         return self._parse_explanation_response(content)
 
@@ -119,6 +121,7 @@ class LocalLlmExampleGenerator:
             llm,
             prompt,
             system_prompt="You explain target-language vocabulary usage for Chinese learners. Return only valid JSON.",
+            max_tokens=self._explanation_max_tokens(),
         )
         return self._parse_explanation_response(content)
 
@@ -130,6 +133,9 @@ class LocalLlmExampleGenerator:
         control: ControlCallback | None = None,
     ) -> tuple[list[tuple[WordEntry, GeneratedExample]], list[str], int]:
         return self._run_parallel(entries, self._generate_with_slot, scope, progress, control)
+
+    def generate_batch(self, entries: list[WordEntry], scope: str = "") -> list[tuple[WordEntry, GeneratedExample]]:
+        return self._generate_batch_with_slot(0, entries, scope)
 
     def correct_many(
         self,
@@ -322,8 +328,13 @@ class LocalLlmExampleGenerator:
         model_size_mb = self._model_size_mb(model_path)
         memory_mb = self._system_capacity_mb()
         cpu_count = os.cpu_count() or 1
+        accelerator = self._detect_accelerator()
 
-        if self._detect_accelerator() == self._CUDA_DEVICE:
+        if accelerator == self._MPS_DEVICE:
+            self._recommended_process_parallelism = 1
+            return self._recommended_process_parallelism
+
+        if accelerator == self._CUDA_DEVICE:
             vram_mb = self._cuda_capacity_mb()
             if vram_mb is not None:
                 vram_per_worker_mb = max(2600, int(model_size_mb * 0.65) + 900)
@@ -341,6 +352,36 @@ class LocalLlmExampleGenerator:
         cpu_workers = max(1, cpu_budget // self._threads_per_model())
         self._recommended_process_parallelism = max(1, min(2, memory_workers, cpu_workers))
         return self._recommended_process_parallelism
+
+    def recommended_supplement_strategy(self) -> dict[str, int | str]:
+        batch_size = self._recommended_batch_generate_size()
+        if batch_size > 1:
+            return {"mode": "batch", "parallelism": 1, "batch_size": batch_size}
+        return {
+            "mode": "parallel",
+            "parallelism": self.recommended_process_parallelism(),
+            "batch_size": 1,
+        }
+
+    def _recommended_batch_generate_size(self) -> int:
+        override = os.getenv("WORDPYCKET_LLM_BATCH_SIZE")
+        if override is not None:
+            try:
+                return max(1, min(32, int(override)))
+            except ValueError as error:
+                raise RuntimeError("WORDPYCKET_LLM_BATCH_SIZE 必须是整数。") from error
+
+        model_path = self._find_existing_model_path()
+        model_size_mb = self._model_size_mb(model_path)
+        if self._detect_accelerator() == self._CUDA_DEVICE:
+            vram_mb = self._cuda_capacity_mb()
+            if vram_mb is None:
+                return 1
+            single_instance_mb = max(2600, int(model_size_mb * 0.65) + 900)
+            if vram_mb < single_instance_mb * 5:
+                return 8
+            return 1
+        return 1
 
     @staticmethod
     def _parse_isolated_stdout(stdout: str) -> dict[str, Any] | None:
@@ -495,6 +536,34 @@ class LocalLlmExampleGenerator:
         prompt = self._build_prompt(entry, scope)
         content = self._call_model(llm, prompt)
         return entry, self._parse_response(content, require_meaning=not entry.meaning.strip())
+
+    def _generate_batch_with_slot(
+        self,
+        slot: int,
+        entries: list[WordEntry],
+        scope: str = "",
+    ) -> list[tuple[WordEntry, GeneratedExample]]:
+        llm = self._load_model(slot)
+        return self._generate_batch_with_llm(llm, entries, scope)
+
+    def _generate_batch_with_llm(
+        self,
+        llm: Any,
+        entries: list[WordEntry],
+        scope: str = "",
+    ) -> list[tuple[WordEntry, GeneratedExample]]:
+        prompt = self._build_batch_prompt(entries, scope)
+        content = self._call_model(llm, prompt, max_tokens=self._batch_max_tokens(len(entries)))
+        try:
+            return self._parse_batch_response(content, entries)
+        except Exception:
+            if len(entries) <= 1:
+                raise
+            midpoint = max(1, len(entries) // 2)
+            return [
+                *self._generate_batch_with_llm(llm, entries[:midpoint], scope),
+                *self._generate_batch_with_llm(llm, entries[midpoint:], scope),
+            ]
 
     def _correct_with_slot(
         self,
@@ -826,7 +895,8 @@ class LocalLlmExampleGenerator:
     ) -> list[WordEntry]:
         if not entries:
             return []
-        removed_indexes: set[int] = set()
+        removed_indexes: set[int] = pdf_cleaning.deterministic_pdf_remove_indexes(entries)
+        protected_indexes = pdf_cleaning.protected_pdf_vocabulary_indexes(entries)
         batches = self._pdf_clean_batches(entries)
         total_batches = len(batches)
         worker_count = min(total_batches, self._parallel_workers())
@@ -860,7 +930,7 @@ class LocalLlmExampleGenerator:
                 for future in finished:
                     batch_number = active.pop(future)
                     try:
-                        removed_indexes.update(future.result())
+                        removed_indexes.update(future.result() - protected_indexes)
                     except Exception as error:
                         message = f"AI 审阅 CSV：第 {batch_number}/{total_batches} 批失败，已保留该批原始词条。{error}"
                         batch_errors.append(message)
@@ -1059,6 +1129,10 @@ class LocalLlmExampleGenerator:
         return prompts.build_prompt(entry, scope)
 
     @staticmethod
+    def _build_batch_prompt(entries: list[WordEntry], scope: str = "") -> str:
+        return prompts.build_batch_prompt(entries, scope)
+
+    @staticmethod
     def _build_correction_prompt(entry: WordEntry, scope: str = "") -> str:
         return prompts.build_correction_prompt(entry, scope)
 
@@ -1077,6 +1151,24 @@ class LocalLlmExampleGenerator:
     @staticmethod
     def _parse_response(content: str, require_meaning: bool = False) -> GeneratedExample:
         return prompts.parse_response(content, require_meaning)
+
+    @staticmethod
+    def _parse_batch_response(content: str, entries: list[WordEntry]) -> list[tuple[WordEntry, GeneratedExample]]:
+        return prompts.parse_batch_response(content, entries)
+
+    @staticmethod
+    def _batch_max_tokens(entry_count: int) -> int:
+        return max(512, min(4096, 220 * max(1, entry_count)))
+
+    @staticmethod
+    def _explanation_max_tokens() -> int:
+        raw_value = os.getenv("WORDPYCKET_LLM_EXPLAIN_TOKENS")
+        if raw_value is not None:
+            try:
+                return max(256, min(4096, int(raw_value)))
+            except ValueError as error:
+                raise RuntimeError("WORDPYCKET_LLM_EXPLAIN_TOKENS 必须是整数。") from error
+        return 768
 
     @staticmethod
     def _parse_correction_response(

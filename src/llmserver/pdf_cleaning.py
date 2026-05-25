@@ -7,6 +7,95 @@ from typing import Any
 
 from llmserver.contracts import WordEntry
 
+_PROTECTED_TERMS = frozenset(
+    {
+        "adapter",
+        "aggregate",
+        "alignment",
+        "architecture",
+        "bayes' theorem",
+        "corpus",
+        "domain",
+        "embedding",
+        "extraction",
+        "file",
+        "frequency",
+        "generate",
+        "gradient",
+        "inference",
+        "machine learning",
+        "matrix",
+        "mention",
+        "normalization",
+        "normalize",
+        "parse",
+        "parser",
+        "pipeline",
+        "repository",
+        "retrieval",
+        "service",
+        "text",
+        "token",
+        "tool",
+        "translation",
+        "use",
+        "vector",
+        "vocabulary",
+    }
+)
+
+_DETERMINISTIC_REMOVE_TERMS = frozenset(
+    {
+        "class",
+        "code",
+        "constant",
+        "count",
+        "csv",
+        "deterministic",
+        "disambiguation",
+        "dr",
+        "emaile",
+        "english",
+        "entity",
+        "final",
+        "form",
+        "function",
+        "id",
+        "identifier",
+        "ids",
+        "inflecte",
+        "keep",
+        "llm",
+        "machine learn",
+        "met",
+        "name",
+        "near",
+        "noise",
+        "noisy",
+        "non-llm",
+        "normaliz",
+        "normalize text",
+        "output",
+        "path",
+        "pdf",
+        "people",
+        "preserv",
+        "real",
+        "remove",
+        "repeatedly",
+        "request",
+        "retry",
+        "some",
+        "system",
+        "technical",
+        "term",
+        "those",
+        "url",
+        "use tool",
+        "variable",
+    }
+)
+
 
 def pdf_clean_batches(entries: list[WordEntry], max_rows: int, char_budget: int) -> list[list[WordEntry]]:
     batches: list[list[WordEntry]] = []
@@ -90,7 +179,8 @@ def build_pdf_vocabulary_cleaning_prompt(entries: list[WordEntry], language: str
         "You will receive at most 100 rows in this batch. "
         "Return only the csv_index values from the first column. Do not return batch row numbers. "
         "Do not include reasons or explanations.\n"
-        "Return JSON only, exactly like: {\"remove_csv_indexes\": [101, 102]}\n"
+        "Return JSON only, exactly like: {\"remove_csv_indexes\": [101, 102]}. "
+        "Keep the JSON complete; if unsure, return an empty remove_csv_indexes array.\n"
         f"CSV rows:\n{json.dumps(rows, ensure_ascii=False, separators=(',', ':'))}"
     )
 
@@ -106,6 +196,8 @@ def parse_pdf_vocabulary_cleaning_response(content: str, batch: list[WordEntry])
     try:
         data = json.loads(cleaned)
     except json.JSONDecodeError:
+        if cleaned.startswith("{") or cleaned.startswith("["):
+            return set()
         return parse_pdf_cleaning_numbers(content, batch)
     if isinstance(data, list):
         data = {"remove_csv_indexes": data}
@@ -131,6 +223,26 @@ def parse_pdf_vocabulary_cleaning_response(content: str, batch: list[WordEntry])
             if entry.word.lower() in words
         )
     return indexes
+
+
+def protected_pdf_vocabulary_indexes(entries: list[WordEntry]) -> set[int]:
+    return {
+        entry.source_index
+        for entry in entries
+        if entry.word.strip().lower() in _PROTECTED_TERMS
+    }
+
+
+def deterministic_pdf_remove_indexes(entries: list[WordEntry]) -> set[int]:
+    has_machine_learning = any(entry.word.strip().lower() == "machine learning" for entry in entries)
+    indexes: set[int] = set()
+    for entry in entries:
+        word = entry.word.strip().lower()
+        if word in _DETERMINISTIC_REMOVE_TERMS:
+            indexes.add(entry.source_index)
+        if has_machine_learning and word == "machine learn":
+            indexes.add(entry.source_index)
+    return indexes - protected_pdf_vocabulary_indexes(entries)
 
 
 def parse_pdf_cleaning_numbers(content: str, batch: list[WordEntry]) -> set[int]:

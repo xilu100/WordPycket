@@ -1,3 +1,4 @@
+import os
 import re
 import sys
 import threading
@@ -88,11 +89,14 @@ class WordPycketApp:
         self._csv_task_worker: BackgroundTaskWorker | None = None
         self._llm_jobs = LlmJobPoller(example_generator)
         self._llm_poll_timer: QTimer | None = None
+        self._llm_idle_close_timer: QTimer | None = None
         self._batch_action = ""
         self._batch_scope = ""
         self._batch_entries: list[WordEntry] = []
         self._batch_index = 0
         self._batch_parallel_limit_value = 2
+        self._batch_mode = "parallel"
+        self._batch_chunk_size = 1
         self._batch_completed_count = 0
         self._batch_finished = False
         self._batch_started_at = 0.0
@@ -110,6 +114,10 @@ class WordPycketApp:
         self._llm_poll_timer = QTimer()
         self._llm_poll_timer.setInterval(250)
         self._llm_poll_timer.timeout.connect(self._safe_slot(self._poll_llm_jobs))
+        self._llm_idle_close_timer = QTimer()
+        self._llm_idle_close_timer.setSingleShot(True)
+        self._llm_idle_close_timer.setInterval(self._llm_idle_close_delay_ms())
+        self._llm_idle_close_timer.timeout.connect(self._safe_slot(self._close_idle_llm_server))
         self._word_refresh_timer = QTimer()
         self._word_refresh_timer.setSingleShot(True)
         self._word_refresh_timer.setInterval(200)
@@ -511,6 +519,7 @@ class WordPycketApp:
             return
         if not self._confirm_model_download("检查模型"):
             return
+        self._cancel_llm_idle_close()
         self._model_check_thread = QThread(self._window)
         self._model_check_worker = BackgroundTaskWorker("model_check", self._example_generator.check_model_runtime)
         self._model_check_worker.moveToThread(self._model_check_thread)
@@ -1122,6 +1131,8 @@ class WordPycketApp:
         if self._pdf_import_thread is not None:
             QMessageBox.information(self._window, "PDF 正在导入", "请等待当前 PDF 导入完成。")
             return
+        if use_llm_cleanup:
+            self._cancel_llm_idle_close()
         self._pdf_import_started_at = time.monotonic()
         self._pdf_ai_started_at = 0.0
         self._pdf_progress_percent = 0
@@ -1628,7 +1639,10 @@ class WordPycketApp:
         self._batch_scope = scope
         self._batch_entries = entries
         self._batch_index = 0
-        self._batch_parallel_limit_value = self._initial_batch_parallel_limit()
+        strategy = self._recommended_batch_strategy(action)
+        self._batch_mode = strategy["mode"]
+        self._batch_chunk_size = strategy["batch_size"]
+        self._batch_parallel_limit_value = strategy["parallelism"]
         self._batch_completed_count = 0
         self._batch_finished = False
         self._batch_started_at = time.monotonic()
@@ -1682,10 +1696,19 @@ class WordPycketApp:
             and self._batch_index < len(self._batch_entries)
             and self._llm_jobs.batch_job_count < self._batch_parallel_limit()
         ):
-            self._start_one_batch_process(self._batch_entries[self._batch_index])
-            self._batch_index += 1
+            entries = self._next_batch_entries()
+            if not entries:
+                break
+            self._start_one_batch_process(entries)
+            self._batch_index += len(entries)
 
-    def _start_one_batch_process(self, entry: WordEntry) -> None:
+    def _next_batch_entries(self) -> list[WordEntry]:
+        if self._batch_action == "补充" and self._batch_mode == "batch":
+            end = min(len(self._batch_entries), self._batch_index + self._batch_chunk_size)
+            return self._batch_entries[self._batch_index:end]
+        return [self._batch_entries[self._batch_index]]
+
+    def _start_one_batch_process(self, entries: list[WordEntry]) -> None:
         self._on_batch_progress(
             self._batch_action,
             self._batch_completed_count,
@@ -1695,10 +1718,16 @@ class WordPycketApp:
         )
 
         try:
-            self._llm_jobs.submit_batch_job(self._batch_action, entry, self._batch_scope)
+            if self._batch_action == "补充" and self._batch_mode == "batch":
+                self._llm_jobs.submit_supplement_batch_job(entries, self._batch_scope)
+            else:
+                self._llm_jobs.submit_batch_job(self._batch_action, entries[0], self._batch_scope)
         except Exception as error:
-            self._batch_errors.append(f"{entry.word}: {error}")
-            self._batch_completed_count += 1
+            label = "、".join(entry.word for entry in entries[:3])
+            if len(entries) > 3:
+                label = f"{label} 等 {len(entries)} 条"
+            self._batch_errors.append(f"{label}: {error}")
+            self._batch_completed_count += len(entries)
             QTimer.singleShot(0, self._pump_batch_processes)
             return
 
@@ -1712,12 +1741,47 @@ class WordPycketApp:
         )
 
     def _ensure_llm_polling(self) -> None:
+        self._cancel_llm_idle_close()
         if self._llm_poll_timer is not None and not self._llm_poll_timer.isActive():
             self._llm_poll_timer.start()
 
     def _stop_llm_polling_if_idle(self) -> None:
         if self._llm_poll_timer is not None and self._llm_jobs.is_idle():
             self._llm_poll_timer.stop()
+            self._schedule_llm_idle_close()
+
+    def _schedule_llm_idle_close(self) -> None:
+        if self._llm_idle_close_timer is None:
+            return
+        if not self._llm_jobs.is_idle():
+            return
+        if self._model_check_thread is not None or self._pdf_import_thread is not None:
+            return
+        self._llm_idle_close_timer.start()
+
+    def _cancel_llm_idle_close(self) -> None:
+        if self._llm_idle_close_timer is not None and self._llm_idle_close_timer.isActive():
+            self._llm_idle_close_timer.stop()
+
+    def _close_idle_llm_server(self) -> None:
+        if not self._llm_jobs.is_idle():
+            return
+        if self._model_check_thread is not None or self._pdf_import_thread is not None:
+            return
+        if self._example_generator is None or not hasattr(self._example_generator, "close"):
+            return
+        try:
+            self._example_generator.close()
+        except Exception:
+            return
+
+    @staticmethod
+    def _llm_idle_close_delay_ms() -> int:
+        raw_value = os.getenv("WORDPYCKET_LLM_IDLE_CLOSE_SECONDS", "60")
+        try:
+            return max(1, int(float(raw_value))) * 1000
+        except ValueError:
+            return 60_000
 
     def _poll_llm_jobs(self) -> None:
         if self._example_generator is None:
@@ -1744,24 +1808,30 @@ class WordPycketApp:
 
     def _poll_batch_jobs(self) -> None:
         for event in self._llm_jobs.poll_batch():
-            self._finish_batch_job(event.entry, result=event.result, error=event.error)
+            self._finish_batch_job(event.entries, result=event.result, error=event.error)
 
     def _finish_batch_job(
         self,
-        entry: WordEntry,
+        entries: list[WordEntry],
         result: dict | None = None,
         error: str = "",
     ) -> None:
         if error:
-            self._batch_errors.append(f"{entry.word}: {error}")
+            label = "、".join(entry.word for entry in entries[:3])
+            if len(entries) > 3:
+                label = f"{label} 等 {len(entries)} 条"
+            self._batch_errors.append(f"{label}: {error}")
         elif result is not None:
             try:
-                self._apply_batch_result(entry, result)
+                self._apply_batch_result(entries, result)
                 self._refresh_words(False)
                 self._restore_table_selection(self._batch_updated_ids)
             except Exception as apply_error:
-                self._batch_errors.append(f"{entry.word}: {apply_error}")
-        self._batch_completed_count += 1
+                label = "、".join(entry.word for entry in entries[:3])
+                if len(entries) > 3:
+                    label = f"{label} 等 {len(entries)} 条"
+                self._batch_errors.append(f"{label}: {apply_error}")
+        self._batch_completed_count += len(entries)
         self._on_batch_progress(
             self._batch_action,
             self._batch_completed_count,
@@ -1771,8 +1841,12 @@ class WordPycketApp:
         )
         QTimer.singleShot(0, self._pump_batch_processes)
 
-    def _apply_batch_result(self, entry: WordEntry, data: dict) -> None:
+    def _apply_batch_result(self, entries: list[WordEntry], data: dict) -> None:
         if self._batch_action == "补充":
+            if self._batch_mode == "batch":
+                self._apply_supplement_batch_result(entries, data)
+                return
+            entry = entries[0]
             updated = self._update_supplemented_entry(
                 entry.id,
                 str(data["example_sentence"]),
@@ -1780,6 +1854,7 @@ class WordPycketApp:
                 str(data.get("meaning", "")),
             )
         else:
+            entry = entries[0]
             updated = self._service.update_text(
                 entry.id,
                 str(data["corrected_word"]),
@@ -1788,6 +1863,24 @@ class WordPycketApp:
             )
         if updated is not None:
             self._batch_updated_ids.append(updated.id)
+
+    def _apply_supplement_batch_result(self, entries: list[WordEntry], data: dict) -> None:
+        items = data.get("items", [])
+        if not isinstance(items, list):
+            raise RuntimeError(f"LLM 批量结果不是数组：{data}")
+        if len(items) != len(entries):
+            raise RuntimeError(f"LLM 批量结果数量不匹配：期望 {len(entries)}，得到 {len(items)}")
+        for entry, item in zip(entries, items, strict=True):
+            if not isinstance(item, dict):
+                raise RuntimeError(f"LLM 批量结果包含非对象条目：{item}")
+            updated = self._update_supplemented_entry(
+                entry.id,
+                str(item["example_sentence"]),
+                str(item["example_sentence_cn"]),
+                str(item.get("meaning", "")),
+            )
+            if updated is not None:
+                self._batch_updated_ids.append(updated.id)
 
     def _update_supplemented_entry(
         self,
@@ -1799,7 +1892,7 @@ class WordPycketApp:
         entry = self._service.get_word(entry_id)
         if entry is None:
             return None
-        if not entry.meaning.strip() and meaning.strip():
+        if (not entry.meaning.strip() or not self._has_cjk_text(entry.meaning)) and self._has_cjk_text(meaning):
             updated = self._service.update_text(
                 entry.id,
                 entry.word,
@@ -1813,6 +1906,10 @@ class WordPycketApp:
             example_sentence,
             example_sentence_cn,
         )
+
+    @staticmethod
+    def _has_cjk_text(text: str) -> bool:
+        return bool(re.search(r"[\u3400-\u9fff]", text or ""))
 
     def _finish_isolated_batch(self) -> None:
         if self._batch_finished:
@@ -1841,6 +1938,38 @@ class WordPycketApp:
     @staticmethod
     def _initial_batch_parallel_limit() -> int:
         return initial_batch_parallel_limit()
+
+    def _recommended_batch_parallel_limit(self) -> int:
+        fallback = self._initial_batch_parallel_limit()
+        if self._example_generator is None or not hasattr(self._example_generator, "recommended_process_parallelism"):
+            return fallback
+        try:
+            return max(1, min(8, int(self._example_generator.recommended_process_parallelism())))
+        except Exception:
+            return fallback
+
+    def _recommended_batch_strategy(self, action: str) -> dict[str, int | str]:
+        fallback = {
+            "mode": "parallel",
+            "parallelism": self._recommended_batch_parallel_limit(),
+            "batch_size": 1,
+        }
+        if action != "补充":
+            return fallback
+        if self._example_generator is None or not hasattr(self._example_generator, "recommended_supplement_strategy"):
+            return fallback
+        try:
+            raw = self._example_generator.recommended_supplement_strategy()
+            mode = str(raw.get("mode", "parallel"))
+            if mode not in {"parallel", "batch"}:
+                return fallback
+            return {
+                "mode": mode,
+                "parallelism": max(1, min(8, int(raw.get("parallelism", 1)))),
+                "batch_size": max(1, min(32, int(raw.get("batch_size", 1)))),
+            }
+        except Exception:
+            return fallback
 
     def _on_batch_progress(self, action: str, done: int, total: int, workers: int, elapsed: float) -> None:
         if action == "补充":

@@ -26,6 +26,7 @@ class ExplainFailed:
 class BatchJobCompleted:
     job_id: str
     entry: WordEntry
+    entries: list[WordEntry]
     result: dict | None = None
     error: str = ""
 
@@ -38,7 +39,7 @@ class LlmJobPoller:
         self._generator = generator
         self._explain_job_id: str | None = None
         self._explain_entry: WordEntry | None = None
-        self._batch_jobs: dict[str, WordEntry] = {}
+        self._batch_jobs: dict[str, list[WordEntry]] = {}
 
     @property
     def explain_entry(self) -> WordEntry | None:
@@ -93,7 +94,21 @@ class LlmJobPoller:
                 "language": "",
             },
         )
-        self._batch_jobs[job_id] = entry
+        self._batch_jobs[job_id] = [entry]
+        return job_id
+
+    def submit_supplement_batch_job(self, entries: list[WordEntry], scope: str) -> str:
+        generator = self._require_generator()
+        job_id = generator.submit_job(
+            "run_action",
+            {
+                "action": "generate_batch",
+                "entries": [self.entry_payload(entry) for entry in entries],
+                "scope": scope,
+                "language": "",
+            },
+        )
+        self._batch_jobs[job_id] = list(entries)
         return job_id
 
     def clear_batch_jobs(self) -> None:
@@ -126,7 +141,7 @@ class LlmJobPoller:
         try:
             if not isinstance(result, dict):
                 raise RuntimeError(f"LLM 结果不是 JSON 对象：{result}")
-            explanation = str(result["explanation"]).strip()
+            explanation = self._format_explanation(result["explanation"])
         except Exception as error:
             return ExplainFailed(str(error))
         return ExplainCompleted(entry, explanation)
@@ -136,40 +151,61 @@ class LlmJobPoller:
             return []
 
         completed: list[BatchJobCompleted] = []
-        for job_id, entry in list(self._batch_jobs.items()):
+        for job_id, entries in list(self._batch_jobs.items()):
+            entry = entries[0]
             try:
                 status = self._generator.job_status(job_id)
             except Exception as error:
-                completed.append(self._pop_batch_job(job_id, entry, error=str(error)))
+                completed.append(self._pop_batch_job(job_id, entries, error=str(error)))
                 continue
             state = str(status.get("state", ""))
             if state in {"queued", "running"}:
                 continue
             if state == "failed":
-                completed.append(self._pop_batch_job(job_id, entry, error=str(status.get("error", "LLM 任务失败。"))))
+                completed.append(self._pop_batch_job(job_id, entries, error=str(status.get("error", "LLM 任务失败。"))))
                 continue
             if state == "completed":
                 result = status.get("result", {})
                 if isinstance(result, dict):
-                    completed.append(self._pop_batch_job(job_id, entry, result=result))
+                    completed.append(self._pop_batch_job(job_id, entries, result=result))
                 else:
-                    completed.append(self._pop_batch_job(job_id, entry, error=f"LLM 结果不是 JSON 对象：{result}"))
+                    completed.append(self._pop_batch_job(job_id, entries, error=f"LLM 结果不是 JSON 对象：{result}"))
         return completed
 
     def _pop_batch_job(
         self,
         job_id: str,
-        entry: WordEntry,
+        entries: list[WordEntry],
         result: dict | None = None,
         error: str = "",
     ) -> BatchJobCompleted:
         self._batch_jobs.pop(job_id, None)
-        return BatchJobCompleted(job_id, entry, result=result, error=error)
+        return BatchJobCompleted(job_id, entries[0], list(entries), result=result, error=error)
 
     def _require_generator(self) -> ExampleGenerator:
         if self._generator is None:
             raise RuntimeError("生成器已不可用。")
         return self._generator
+
+    @staticmethod
+    def _format_explanation(value) -> str:
+        if isinstance(value, dict):
+            preferred_labels = ["意思", "常规用法", "领域用法"]
+            lines = []
+            used_labels = set()
+            for label in preferred_labels:
+                text = str(value.get(label, "")).strip()
+                if text:
+                    lines.append(f"{label}：{text}")
+                    used_labels.add(label)
+            for label, text_value in value.items():
+                if label in used_labels:
+                    continue
+                text = str(text_value).strip()
+                if text:
+                    lines.append(f"{label}：{text}")
+            return "\n".join(lines).strip()
+        return str(value).strip()
 
     @staticmethod
     def entry_payload(entry: WordEntry) -> dict:

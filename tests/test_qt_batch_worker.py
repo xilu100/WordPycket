@@ -11,7 +11,7 @@ from wordpycket.domain.entities import WordEntry
 from pathlib import Path
 
 from llmserver.engine import LocalLlmExampleGenerator as LlmEngine
-from llmserver.server import JobStore
+from llmserver.server import JobStore, LlmRpcHandler
 from wordpycket.infrastructure.example_generator import GeneratedExample, LocalLlmExampleGenerator
 from wordpycket.presentation.qt_app import WordPycketApp
 from wordpycket.presentation.qt_workers import BatchWorker
@@ -109,6 +109,59 @@ def test_process_parallel_limit_override_is_bounded(monkeypatch) -> None:
         assert "WORDPYCKET_LLM_PROCESS_PARALLEL" in str(error)
     else:
         raise AssertionError("invalid override should fail loudly")
+
+
+def test_process_parallel_recommendation_does_not_start_llm_server(monkeypatch) -> None:
+    starts = []
+
+    def fail_if_started(*_args, **_kwargs):
+        starts.append(True)
+        raise AssertionError("parallel recommendation must not start the LLM service")
+
+    monkeypatch.delenv("WORDPYCKET_LLM_PROCESS_PARALLEL", raising=False)
+    monkeypatch.setattr("subprocess.Popen", fail_if_started)
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_find_existing_model_path", lambda: None)
+    monkeypatch.setattr(generator, "_detect_accelerator", lambda: generator._CPU_DEVICE)
+    monkeypatch.setattr(generator, "_cuda_capacity_mb", lambda: None)
+    monkeypatch.setattr(generator, "_system_capacity_mb", lambda: 16 * 1024)
+
+    assert generator.recommended_process_parallelism() >= 1
+    assert starts == []
+
+
+def test_supplement_strategy_does_not_start_llm_server(monkeypatch) -> None:
+    starts = []
+
+    def fail_if_started(*_args, **_kwargs):
+        starts.append(True)
+        raise AssertionError("supplement strategy must not start the LLM service")
+
+    monkeypatch.delenv("WORDPYCKET_LLM_BATCH_SIZE", raising=False)
+    monkeypatch.setattr("subprocess.Popen", fail_if_started)
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_find_existing_model_path", lambda: None)
+    monkeypatch.setattr(generator, "_model_size_mb", lambda _path: 4466)
+    monkeypatch.setattr(generator, "_detect_accelerator", lambda: generator._CUDA_DEVICE)
+    monkeypatch.setattr(generator, "_cuda_capacity_mb", lambda: 8192)
+
+    assert generator.recommended_supplement_strategy() == {
+        "mode": "batch",
+        "parallelism": 1,
+        "batch_size": 8,
+    }
+    assert starts == []
+
+
+def test_client_mps_parallel_recommendation_uses_single_model_instance(monkeypatch) -> None:
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.delenv("WORDPYCKET_LLM_PROCESS_PARALLEL", raising=False)
+    monkeypatch.setattr(generator, "_find_existing_model_path", lambda: None)
+    monkeypatch.setattr(generator, "_model_size_mb", lambda _path: 4096)
+    monkeypatch.setattr(generator, "_system_capacity_mb", lambda: 16 * 1024)
+    monkeypatch.setattr(generator, "_detect_accelerator", lambda: generator._MPS_DEVICE)
+
+    assert generator.recommended_process_parallelism() == 1
 
 
 def test_isolated_environment_does_not_start_llm_server_on_gui_thread(monkeypatch) -> None:
@@ -411,6 +464,186 @@ def test_gui_initial_batch_parallel_limit_does_not_probe_hardware(monkeypatch) -
     assert WordPycketApp._initial_batch_parallel_limit() == 8
 
 
+def test_gui_batch_parallel_limit_uses_generator_recommendation(monkeypatch) -> None:
+    monkeypatch.delenv("WORDPYCKET_LLM_PROCESS_PARALLEL", raising=False)
+
+    class Generator:
+        def recommended_process_parallelism(self) -> int:
+            return 4
+
+    app = object.__new__(WordPycketApp)
+    app._example_generator = Generator()
+
+    assert app._recommended_batch_parallel_limit() == 4
+
+
+def test_gui_batch_parallel_limit_falls_back_when_recommendation_fails(monkeypatch) -> None:
+    monkeypatch.setenv("WORDPYCKET_LLM_PROCESS_PARALLEL", "3")
+
+    class Generator:
+        def recommended_process_parallelism(self) -> int:
+            raise RuntimeError("not ready")
+
+    app = object.__new__(WordPycketApp)
+    app._example_generator = Generator()
+
+    assert app._recommended_batch_parallel_limit() == 3
+
+
+def test_gui_uses_supplement_batch_strategy() -> None:
+    class Generator:
+        def recommended_process_parallelism(self) -> int:
+            return 4
+
+        def recommended_supplement_strategy(self) -> dict:
+            return {"mode": "batch", "parallelism": 1, "batch_size": 8}
+
+    app = object.__new__(WordPycketApp)
+    app._example_generator = Generator()
+
+    assert app._recommended_batch_strategy("补充") == {
+        "mode": "batch",
+        "parallelism": 1,
+        "batch_size": 8,
+    }
+    assert app._recommended_batch_strategy("修正") == {
+        "mode": "parallel",
+        "parallelism": 4,
+        "batch_size": 1,
+    }
+
+
+def test_supplement_update_replaces_non_chinese_meaning() -> None:
+    class Service:
+        def __init__(self) -> None:
+            self.entry = WordEntry(word="gradient", meaning="Gradient", id="entry-1")
+
+        def get_word(self, _entry_id):
+            return self.entry
+
+        def update_text(self, entry_id, word, meaning, forms):
+            self.entry = WordEntry(id=entry_id, word=word, meaning=meaning, forms=forms)
+            return self.entry
+
+        def update_examples(self, entry_id, example_sentence, example_sentence_cn):
+            self.entry = WordEntry(
+                id=entry_id,
+                word=self.entry.word,
+                meaning=self.entry.meaning,
+                forms=self.entry.forms,
+                example_sentence=example_sentence,
+                example_sentence_cn=example_sentence_cn,
+            )
+            return self.entry
+
+    service = Service()
+    app = object.__new__(WordPycketApp)
+    app._service = service
+
+    updated = app._update_supplemented_entry("entry-1", "The gradient is calculated.", "梯度被计算。", "梯度")
+
+    assert updated.meaning == "梯度"
+    assert updated.example_sentence == "The gradient is calculated."
+
+
+def test_idle_llm_close_closes_generator_only_when_idle() -> None:
+    class Jobs:
+        def __init__(self, idle: bool) -> None:
+            self.idle = idle
+
+        def is_idle(self) -> bool:
+            return self.idle
+
+    class Generator:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    generator = Generator()
+    app = object.__new__(WordPycketApp)
+    app._llm_jobs = Jobs(True)
+    app._example_generator = generator
+    app._model_check_thread = None
+    app._pdf_import_thread = None
+
+    app._close_idle_llm_server()
+
+    assert generator.closed == 1
+
+    app._llm_jobs = Jobs(False)
+    app._close_idle_llm_server()
+
+    assert generator.closed == 1
+
+
+def test_idle_llm_close_delay_can_be_configured(monkeypatch) -> None:
+    monkeypatch.setenv("WORDPYCKET_LLM_IDLE_CLOSE_SECONDS", "2")
+
+    assert WordPycketApp._llm_idle_close_delay_ms() == 2000
+
+    monkeypatch.setenv("WORDPYCKET_LLM_IDLE_CLOSE_SECONDS", "bad")
+
+    assert WordPycketApp._llm_idle_close_delay_ms() == 60000
+
+
+def test_idle_llm_close_timer_cancels_during_next_job_and_reschedules_afterwards() -> None:
+    class Timer:
+        def __init__(self, active: bool = False) -> None:
+            self.active = active
+            self.starts = 0
+            self.stops = 0
+
+        def isActive(self) -> bool:
+            return self.active
+
+        def start(self) -> None:
+            self.starts += 1
+            self.active = True
+
+        def stop(self) -> None:
+            self.stops += 1
+            self.active = False
+
+    class Jobs:
+        def __init__(self) -> None:
+            self.idle = False
+
+        def is_idle(self) -> bool:
+            return self.idle
+
+    jobs = Jobs()
+    idle_timer = Timer()
+    poll_timer = Timer(active=True)
+    app = object.__new__(WordPycketApp)
+    app._llm_jobs = jobs
+    app._llm_idle_close_timer = idle_timer
+    app._llm_poll_timer = poll_timer
+    app._model_check_thread = None
+    app._pdf_import_thread = None
+
+    jobs.idle = True
+    app._stop_llm_polling_if_idle()
+
+    assert poll_timer.active is False
+    assert idle_timer.active is True
+    assert idle_timer.starts == 1
+
+    jobs.idle = False
+    app._ensure_llm_polling()
+
+    assert idle_timer.active is False
+    assert idle_timer.stops == 1
+    assert poll_timer.active is True
+
+    jobs.idle = True
+    app._stop_llm_polling_if_idle()
+
+    assert idle_timer.active is True
+    assert idle_timer.starts == 2
+
+
 def test_llm_job_store_runs_bounded_jobs_incrementally() -> None:
     store = JobStore(max_workers=2)
     started: queue.Queue[int] = queue.Queue()
@@ -439,3 +672,35 @@ def test_llm_job_store_runs_bounded_jobs_incrementally() -> None:
         threading.Event().wait(0.01)
 
     assert deadline.is_set()
+
+
+def test_generate_batch_rpc_always_uses_single_model_slot() -> None:
+    calls = []
+
+    class Generator:
+        def _generate_batch_with_slot(self, slot, entries, scope):
+            calls.append((slot, [entry.word for entry in entries], scope))
+            return []
+
+    handler = object.__new__(LlmRpcHandler)
+    handler.generator = Generator()
+
+    result = handler._run_action(
+        {
+            "action": "generate_batch",
+            "entries": [
+                {
+                    "word": "vector",
+                    "meaning": "向量",
+                    "source_index": 1,
+                    "frequency": 1,
+                    "forms": "",
+                }
+            ],
+            "scope": "AI",
+        },
+        slot=1,
+    )
+
+    assert result == {"items": []}
+    assert calls == [(0, ["vector"], "AI")]
