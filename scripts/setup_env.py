@@ -212,7 +212,9 @@ def install_llama_cpp(python: Path, device: str, strict_accel: bool) -> None:
             return
         if install_llama_metal_prebuilt(python):
             return
-        message = "No compatible prebuilt Metal llama-cpp-python wheel was installed."
+        if install_llama_metal_source(python):
+            return
+        message = "No compatible prebuilt Metal llama-cpp-python wheel was installed, and the local Metal source build failed."
         if strict_accel:
             raise RuntimeError(message)
         print(f"{message} Falling back to CPU.")
@@ -240,6 +242,30 @@ def install_llama_metal_prebuilt(python: Path) -> bool:
     wheel_index = "https://abetlen.github.io/llama-cpp-python/whl/metal"
     print("Trying prebuilt Metal llama-cpp-python wheel.")
     return run_optional(llama_prebuilt_command(python, wheel_index))
+
+
+def install_llama_metal_source(python: Path) -> bool:
+    print("Prebuilt Metal wheel failed; building llama-cpp-python with Metal from source.")
+    env = os.environ.copy()
+    cmake_args = env.get("CMAKE_ARGS", "")
+    metal_arg = "-DGGML_METAL=on"
+    env["CMAKE_ARGS"] = f"{cmake_args} {metal_arg}".strip() if metal_arg not in cmake_args else cmake_args
+    env["FORCE_CMAKE"] = "1"
+    return run_optional(
+        [
+            str(python),
+            "-m",
+            "pip",
+            "install",
+            "--upgrade",
+            "--force-reinstall",
+            "--no-cache-dir",
+            "--no-binary",
+            "llama-cpp-python",
+            "llama-cpp-python>=0.3.0",
+        ],
+        env=env,
+    )
 
 
 def llama_prebuilt_command(python: Path, wheel_index: str) -> list[str]:
@@ -285,9 +311,9 @@ def run(command: list[str], env: dict[str, str] | None = None) -> None:
     subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=True)
 
 
-def run_optional(command: list[str]) -> bool:
+def run_optional(command: list[str], env: dict[str, str] | None = None) -> bool:
     print(f"$ {' '.join(command)}")
-    result = subprocess.run(command, cwd=PROJECT_ROOT, check=False)
+    result = subprocess.run(command, cwd=PROJECT_ROOT, env=env, check=False)
     return result.returncode == 0
 
 
