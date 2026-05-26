@@ -7,6 +7,7 @@ from wordpycket.application.services import WordService
 from wordpycket.infrastructure.csv_importer import WordFrequencyCsvImporter
 from wordpycket.infrastructure.csv_library import CsvLibrary
 from wordpycket.infrastructure.example_generator import LocalLlmExampleGenerator
+from wordpycket.infrastructure.meaning_translator import ArgosMeaningTranslator
 from wordpycket.infrastructure.pdf_vocabulary_importer import run_pdf_import_isolated
 from wordpycket.infrastructure.repositories import SqliteWordRepository
 from wordpycket.infrastructure.settings_store import JsonSettingsStore
@@ -46,6 +47,7 @@ def main() -> None:
     repository = SqliteWordRepository(initial_database)
     service = WordService(repository)
     example_generator = LocalLlmExampleGenerator(model_dir)
+    meaning_translator = ArgosMeaningTranslator()
     settings = JsonSettingsStore(data_dir / "settings.json")
     dataset_service = DatasetService(
         service,
@@ -69,6 +71,7 @@ def main() -> None:
     app = WordPycketApp(
         service,
         example_generator=example_generator,
+        meaning_translator=meaning_translator,
         csv_import_loader=lambda path: WordFrequencyCsvImporter(path).load_with_metadata(),
         pdf_import_loader=dataset_service.import_pdf,
         csv_files_loader=library.list_csv_files,
@@ -76,7 +79,7 @@ def main() -> None:
         csv_switcher=dataset_service.activate_csv,
         csv_upload_handler=dataset_service.upload_csv,
         csv_delete_handler=dataset_service.delete_csv,
-        ai_scope_loader=lambda: settings.get_string("ai_scope", "人工智能相关的翻译"),
+        ai_scope_loader=lambda: settings.get_string("ai_scope", "AI 领域的译法"),
         ai_scope_saver=lambda value: settings.set_string("ai_scope", value),
         current_language_loader=current_language,
     )

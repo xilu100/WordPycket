@@ -66,6 +66,8 @@ class LlmJobPoller:
         return self._explain_job_id is None and not self._batch_jobs
 
     def submit_explain(self, entry: WordEntry, scope: str, language: str) -> None:
+        if self.has_explain_job():
+            raise RuntimeError("当前词条还在解释中。")
         generator = self._require_generator()
         self._explain_job_id = generator.submit_job(
             "run_action",
@@ -82,7 +84,7 @@ class LlmJobPoller:
         self._explain_job_id = None
         self._explain_entry = None
 
-    def submit_batch_job(self, action: str, entry: WordEntry, scope: str) -> str:
+    def submit_batch_job(self, action: str, entry: WordEntry, scope: str, language: str = "") -> str:
         generator = self._require_generator()
         llm_action = "generate" if action == "补充" else "correct"
         job_id = generator.submit_job(
@@ -91,13 +93,13 @@ class LlmJobPoller:
                 "action": llm_action,
                 "entry": self.entry_payload(entry),
                 "scope": scope,
-                "language": "",
+                "language": language,
             },
         )
         self._batch_jobs[job_id] = [entry]
         return job_id
 
-    def submit_supplement_batch_job(self, entries: list[WordEntry], scope: str) -> str:
+    def submit_supplement_batch_job(self, entries: list[WordEntry], scope: str, language: str = "") -> str:
         generator = self._require_generator()
         job_id = generator.submit_job(
             "run_action",
@@ -105,7 +107,7 @@ class LlmJobPoller:
                 "action": "generate_batch",
                 "entries": [self.entry_payload(entry) for entry in entries],
                 "scope": scope,
-                "language": "",
+                "language": language,
             },
         )
         self._batch_jobs[job_id] = list(entries)
@@ -129,7 +131,7 @@ class LlmJobPoller:
             message = str(progress.get("message", "解释中")) if isinstance(progress, dict) else "解释中"
             return ExplainProgress(message)
         if state == "failed":
-            error = str(status.get("error", "AI解释失败。"))
+            error = str(status.get("error", "AI 速解失败。"))
             self.finish_explain()
             return ExplainFailed(error)
         if state != "completed":
@@ -140,7 +142,7 @@ class LlmJobPoller:
         self.finish_explain()
         try:
             if not isinstance(result, dict):
-                raise RuntimeError(f"LLM 结果不是 JSON 对象：{result}")
+                raise RuntimeError(f"AI 返回结果格式不正确：{result}")
             explanation = self._format_explanation(result["explanation"])
         except Exception as error:
             return ExplainFailed(str(error))
@@ -162,14 +164,14 @@ class LlmJobPoller:
             if state in {"queued", "running"}:
                 continue
             if state == "failed":
-                completed.append(self._pop_batch_job(job_id, entries, error=str(status.get("error", "LLM 任务失败。"))))
+                completed.append(self._pop_batch_job(job_id, entries, error=str(status.get("error", "AI 任务失败。"))))
                 continue
             if state == "completed":
                 result = status.get("result", {})
                 if isinstance(result, dict):
                     completed.append(self._pop_batch_job(job_id, entries, result=result))
                 else:
-                    completed.append(self._pop_batch_job(job_id, entries, error=f"LLM 结果不是 JSON 对象：{result}"))
+                    completed.append(self._pop_batch_job(job_id, entries, error=f"AI 返回结果格式不正确：{result}"))
         return completed
 
     def _pop_batch_job(
@@ -184,7 +186,7 @@ class LlmJobPoller:
 
     def _require_generator(self) -> ExampleGenerator:
         if self._generator is None:
-            raise RuntimeError("生成器已不可用。")
+            raise RuntimeError("AI 模型服务已不可用。")
         return self._generator
 
     @staticmethod

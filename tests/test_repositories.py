@@ -48,7 +48,7 @@ def test_sqlite_reset_progress_preserves_csv_fields_and_examples(tmp_path) -> No
     assert reset_entry.status == "学习池"
 
 
-def test_sqlite_import_replaces_existing_meaning_with_csv_meaning(tmp_path) -> None:
+def test_sqlite_import_preserves_existing_meaning_when_csv_meaning_is_blank(tmp_path) -> None:
     repository = SqliteWordRepository(tmp_path / "words.db")
     original = WordEntry(word="kernel", meaning="内核")
     repository.save(original)
@@ -67,6 +67,30 @@ def test_sqlite_import_replaces_existing_meaning_with_csv_meaning(tmp_path) -> N
     imported = repository.get(original.id)
     assert imported_count == 1
     assert imported is not None
-    assert imported.meaning == ""
+    assert imported.meaning == "内核"
+    assert imported.frequency == 10
+    assert imported.forms == "kernels"
+
+
+def test_sqlite_import_replaces_existing_meaning_when_csv_meaning_is_present(tmp_path) -> None:
+    repository = SqliteWordRepository(tmp_path / "words.db")
+    original = WordEntry(word="kernel", meaning="内核")
+    repository.save(original)
+
+    imported_count = repository.save_many(
+        [
+            WordEntry(
+                word="kernel",
+                meaning="核心",
+                frequency=10,
+                forms="kernels",
+            )
+        ]
+    )
+
+    imported = repository.get(original.id)
+    assert imported_count == 1
+    assert imported is not None
+    assert imported.meaning == "核心"
     assert imported.frequency == 10
     assert imported.forms == "kernels"

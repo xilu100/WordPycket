@@ -35,6 +35,7 @@ class GeneratedExample:
 class GeneratedCorrection:
     corrected_word: str
     note: str = ""
+    should_update: bool = False
 
 
 @dataclass(frozen=True)
@@ -92,26 +93,27 @@ class LocalLlmExampleGenerator:
         self._owns_process = False
         atexit.register(self.close)
 
-    def generate(self, entry: WordEntry, scope: str = "") -> GeneratedExample:
-        data = self._rpc("generate", {"entry": self._entry_payload(entry), "scope": scope})
+    def generate(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExample:
+        data = self._rpc("generate", {"entry": self._entry_payload(entry), "scope": scope, "language": language})
         return GeneratedExample(
             example_sentence=str(data["example_sentence"]),
             example_sentence_cn=str(data["example_sentence_cn"]),
             meaning=str(data.get("meaning", "")),
         )
 
-    def generate_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedExample:
-        return self.generate(entry, scope)
+    def generate_isolated(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExample:
+        return self.generate(entry, scope, language)
 
-    def correct_entry(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
-        data = self._rpc("correct_entry", {"entry": self._entry_payload(entry), "scope": scope})
+    def correct_entry(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedCorrection:
+        data = self._rpc("correct_entry", {"entry": self._entry_payload(entry), "scope": scope, "language": language})
         return GeneratedCorrection(
             corrected_word=str(data["corrected_word"]),
             note=str(data.get("note", "")),
+            should_update=bool(data.get("should_update", False)),
         )
 
-    def correct_entry_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
-        return self.correct_entry(entry, scope)
+    def correct_entry_isolated(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedCorrection:
+        return self.correct_entry(entry, scope, language)
 
     def explain_entry(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExplanation:
         data = self._rpc(
@@ -149,8 +151,9 @@ class LocalLlmExampleGenerator:
         scope: str = "",
         progress: ProgressCallback | None = None,
         control: ControlCallback | None = None,
+        language: str = "",
     ) -> tuple[list[tuple[WordEntry, GeneratedExample]], list[str], int]:
-        raw_results, errors, workers = self._run_many_jobs(entries, "generate", scope, progress, control)
+        raw_results, errors, workers = self._run_many_jobs(entries, "generate", scope, language, progress, control)
         results = [
             (
                 entry,
@@ -170,14 +173,16 @@ class LocalLlmExampleGenerator:
         scope: str = "",
         progress: ProgressCallback | None = None,
         control: ControlCallback | None = None,
+        language: str = "",
     ) -> tuple[list[tuple[WordEntry, GeneratedCorrection]], list[str], int]:
-        raw_results, errors, workers = self._run_many_jobs(entries, "correct", scope, progress, control)
+        raw_results, errors, workers = self._run_many_jobs(entries, "correct", scope, language, progress, control)
         results = [
             (
                 entry,
                 GeneratedCorrection(
                     corrected_word=str(data["corrected_word"]),
                     note=str(data.get("note", "")),
+                    should_update=bool(data.get("should_update", False)),
                 ),
             )
             for entry, data in raw_results
@@ -326,7 +331,7 @@ class LocalLlmExampleGenerator:
                 "remote_job_id": "",
                 "state": "queued",
                 "stage": "queued",
-                "progress": {"message": "等待 LLM 服务", "percent": 0},
+                "progress": {"message": "正在启动 AI 模型服务", "percent": 0},
                 "result": None,
                 "error": "",
             }
@@ -337,7 +342,7 @@ class LocalLlmExampleGenerator:
         with self._local_jobs_lock:
             job = self._local_jobs.get(job_id)
             if job is None:
-                raise RuntimeError(f"未知 LLM 任务：{job_id}")
+                raise RuntimeError(f"未知 AI 任务：{job_id}")
             return dict(job)
 
     def close(self) -> None:
@@ -432,6 +437,7 @@ class LocalLlmExampleGenerator:
         entries: list[WordEntry],
         action: str,
         scope: str,
+        language: str,
         progress: Any,
         control: Any,
     ) -> tuple[list[tuple[WordEntry, dict[str, Any]]], list[str], int]:
@@ -462,7 +468,7 @@ class LocalLlmExampleGenerator:
                     "action": action,
                     "entry": self._entry_payload(entry),
                     "scope": scope,
-                    "language": "",
+                    "language": language,
                 },
             )
             while True:
@@ -471,10 +477,10 @@ class LocalLlmExampleGenerator:
                 if state == "completed":
                     result = status.get("result", {})
                     if not isinstance(result, dict):
-                        raise RuntimeError(f"LLM 结果不是 JSON 对象：{result}")
+                        raise RuntimeError(f"AI 返回结果格式不正确：{result}")
                     return entry, result
                 if state == "failed":
-                    raise RuntimeError(str(status.get("error", "LLM 任务失败。")))
+                    raise RuntimeError(str(status.get("error", "AI 任务失败。")))
                 time.sleep(self._poll_interval_seconds())
 
         def submit_next(executor: ThreadPoolExecutor) -> bool:
@@ -509,7 +515,7 @@ class LocalLlmExampleGenerator:
         last_progress: tuple[str, int] | None = None
         while True:
             if time.monotonic() >= idle_deadline:
-                raise RuntimeError(f"LLM 任务 {job_id} 超过 {self._operation_timeout_seconds()} 秒没有新进度。")
+                raise RuntimeError(f"AI 任务超过 {self._operation_timeout_seconds()} 秒没有新进度。")
             status = self.job_status(job_id)
             progress = status.get("progress", {})
             if isinstance(progress, dict):
@@ -525,7 +531,7 @@ class LocalLlmExampleGenerator:
             if state == "completed":
                 return status.get("result")
             if state == "failed":
-                raise RuntimeError(str(status.get("error", "LLM 任务失败。")))
+                raise RuntimeError(str(status.get("error", "AI 任务失败。")))
             time.sleep(self._poll_interval_seconds())
 
     def _drive_local_job(self, job_id: str) -> None:
@@ -536,7 +542,7 @@ class LocalLlmExampleGenerator:
                     job_id,
                     state="failed",
                     stage="failed",
-                    error="LLM 服务未声明有可参与响应的模型。",
+                    error="AI 模型服务未声明可用模型。",
                 )
                 return
             self._submit_remote_job(job_id)
@@ -554,7 +560,7 @@ class LocalLlmExampleGenerator:
                 job_id,
                 state="failed",
                 stage="failed",
-                progress={"message": "LLM 任务失败", "percent": 100},
+                progress={"message": "AI 任务失败", "percent": 100},
                 error=str(error),
             )
 
@@ -565,7 +571,7 @@ class LocalLlmExampleGenerator:
             job_id,
             state="queued",
             stage="starting",
-            progress={"message": "等待 LLM 服务 ready", "percent": 0},
+            progress={"message": "正在启动 AI 模型服务", "percent": 0},
         )
         with self._server_start_lock:
             if self._base_url:
@@ -587,25 +593,25 @@ class LocalLlmExampleGenerator:
             line = self._ready_messages.get(timeout=self._startup_timeout_seconds()).strip()
         except queue.Empty as error:
             self._stop_unready_process()
-            raise RuntimeError(f"LLM 服务 {self._startup_timeout_seconds()} 秒内没有发送 ready JSON，停止等待。") from error
+            raise RuntimeError(f"AI 模型服务 {self._startup_timeout_seconds()} 秒内没有完成启动，已停止等待。") from error
         if not line:
             self._stop_unready_process()
-            raise RuntimeError("LLM 服务启动失败。")
+            raise RuntimeError("AI 模型服务启动失败。")
         try:
             data = json.loads(line)
         except json.JSONDecodeError as error:
             self._stop_unready_process()
-            raise RuntimeError(f"LLM 服务未返回 JSON：{line}") from error
+            raise RuntimeError(f"AI 模型服务返回内容格式不正确：{line}") from error
         if not isinstance(data, dict) or data.get("type") != "ready":
             self._stop_unready_process()
-            raise RuntimeError(f"LLM 服务未 ready：{data}")
+            raise RuntimeError(f"AI 模型服务未就绪：{data}")
         self._base_url = f"http://{data['host']}:{int(data['port'])}"
         self._server_model_available = bool(data.get("model_available"))
         self._ready_messages = None
         self._update_waiting_local_jobs(
             state="queued",
             stage="ready",
-            progress={"message": "LLM 服务已 ready", "percent": 1},
+            progress={"message": "AI 模型服务已启动", "percent": 1},
         )
 
     def _local_job_requires_ready_model(self, job_id: str) -> bool:
@@ -646,7 +652,7 @@ class LocalLlmExampleGenerator:
         )
         result = job.get("result")
         if not isinstance(result, dict) or not result.get("job_id"):
-            raise RuntimeError(f"LLM 服务没有返回有效 job_id：{job}")
+            raise RuntimeError(f"AI 模型服务没有返回有效任务编号：{job}")
         return self._wait_for_job(base_url, str(result["job_id"]), progress_callback)
 
     def _request_json(self, base_url: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -660,9 +666,9 @@ class LocalLlmExampleGenerator:
         finally:
             connection.close()
         if not isinstance(payload, dict):
-            raise RuntimeError("LLM 服务返回内容不是 JSON 对象。")
+            raise RuntimeError("AI 模型服务返回内容格式不正确。")
         if not payload.get("ok"):
-            raise RuntimeError(str(payload.get("error", "LLM 服务调用失败。")))
+            raise RuntimeError(str(payload.get("error", "AI 模型服务调用失败。")))
         return payload
 
     def _wait_for_job(self, base_url: str, job_id: str, progress_callback: Any | None = None) -> Any:
@@ -670,14 +676,14 @@ class LocalLlmExampleGenerator:
         last_progress: tuple[str, int] | None = None
         while True:
             if time.monotonic() >= deadline:
-                raise RuntimeError(f"LLM 任务 {job_id} 超过 {self._operation_timeout_seconds()} 秒未完成。")
+                raise RuntimeError(f"AI 任务超过 {self._operation_timeout_seconds()} 秒未完成。")
             payload = self._request_json(
                 base_url,
                 {"method": "job_status", "params": {"job_id": job_id}},
             )
             status = payload.get("result")
             if not isinstance(status, dict):
-                raise RuntimeError(f"LLM 任务状态不是 JSON 对象：{payload}")
+                raise RuntimeError(f"AI 任务状态格式不正确：{payload}")
             progress = status.get("progress", {})
             if isinstance(progress, dict):
                 message = str(progress.get("message", status.get("stage", "")))
@@ -690,13 +696,13 @@ class LocalLlmExampleGenerator:
             if state == "completed":
                 return status.get("result")
             if state == "failed":
-                raise RuntimeError(str(status.get("error", "LLM 任务失败。")))
+                raise RuntimeError(str(status.get("error", "AI 任务失败。")))
             time.sleep(self._poll_interval_seconds())
 
     def _ensure_server(self, require_model: bool = True) -> str:
         if self._base_url:
             if require_model and not self._server_model_available:
-                raise RuntimeError("LLM 服务未声明有可参与响应的模型。")
+                raise RuntimeError("AI 模型服务未声明可用模型。")
             return self._base_url
         env = os.environ.copy()
         env["PYTHONIOENCODING"] = "utf-8"
@@ -722,12 +728,12 @@ class LocalLlmExampleGenerator:
             raise
         if data.get("type") != "ready":
             self._stop_unready_process()
-            raise RuntimeError(f"LLM 服务启动消息不是 ready JSON：{data}")
+            raise RuntimeError(f"AI 模型服务启动消息格式不正确：{data}")
         self._base_url = f"http://{data['host']}:{int(data['port'])}"
         self._server_model_available = bool(data.get("model_available"))
         if require_model and not self._server_model_available:
             self._stop_unready_process()
-            raise RuntimeError("LLM 服务未声明有可参与响应的模型。")
+            raise RuntimeError("AI 模型服务未声明可用模型。")
         return self._base_url
 
     def _start_server_async(self) -> None:
@@ -772,31 +778,31 @@ class LocalLlmExampleGenerator:
                 {
                     "state": "queued",
                     "stage": "starting",
-                    "progress": {"message": "等待 LLM 服务 ready", "percent": 0},
+                    "progress": {"message": "正在启动 AI 模型服务", "percent": 0},
                 }
             )
             return
         if not line:
-            job.update({"state": "failed", "stage": "failed", "error": "LLM 服务启动失败。"})
+            job.update({"state": "failed", "stage": "failed", "error": "AI 模型服务启动失败。"})
             return
         try:
             data = json.loads(line)
         except json.JSONDecodeError:
-            job.update({"state": "failed", "stage": "failed", "error": f"LLM 服务未返回 JSON：{line}"})
+            job.update({"state": "failed", "stage": "failed", "error": f"AI 模型服务返回内容格式不正确：{line}"})
             return
         if not isinstance(data, dict) or data.get("type") != "ready":
-            job.update({"state": "failed", "stage": "failed", "error": f"LLM 服务未 ready：{data}"})
+            job.update({"state": "failed", "stage": "failed", "error": f"AI 模型服务未就绪：{data}"})
             return
         self._base_url = f"http://{data['host']}:{int(data['port'])}"
         self._server_model_available = bool(data.get("model_available"))
         if self._method_requires_ready_model(str(job["method"]), job.get("params")) and not self._server_model_available:
-            job.update({"state": "failed", "stage": "failed", "error": "LLM 服务未声明有可参与响应的模型。"})
+            job.update({"state": "failed", "stage": "failed", "error": "AI 模型服务未声明可用模型。"})
             return
         job.update(
             {
                 "state": "queued",
                 "stage": "ready",
-                "progress": {"message": "LLM 服务已 ready", "percent": 1},
+                "progress": {"message": "AI 模型服务已启动", "percent": 1},
             }
         )
 
@@ -820,7 +826,7 @@ class LocalLlmExampleGenerator:
                 job_id,
                 state="failed",
                 stage="failed",
-                error=f"LLM 服务没有返回 job_id：{payload}",
+                error=f"AI 模型服务没有返回任务编号：{payload}",
             )
             return
         self._update_local_job(
@@ -847,7 +853,7 @@ class LocalLlmExampleGenerator:
                 job_id,
                 state="failed",
                 stage="failed",
-                error=f"LLM 任务状态不是 JSON：{payload}",
+                error=f"AI 任务状态格式不正确：{payload}",
             )
             return
         self._update_local_job(job_id, **status)
@@ -868,18 +874,18 @@ class LocalLlmExampleGenerator:
         try:
             line = messages.get(timeout=timeout).strip()
         except queue.Empty as error:
-            raise RuntimeError(f"LLM 服务 {timeout} 秒内没有发送 ready JSON，停止等待。") from error
+            raise RuntimeError(f"AI 模型服务 {timeout} 秒内没有完成启动，已停止等待。") from error
         if not line:
             stderr = ""
             if process.poll() is not None and process.stderr is not None:
                 stderr = process.stderr.read().strip()
-            raise RuntimeError(f"LLM 服务启动失败。{stderr}")
+            raise RuntimeError(f"AI 模型服务启动失败。{stderr}")
         try:
             data = json.loads(line)
         except json.JSONDecodeError as error:
-            raise RuntimeError(f"LLM 服务启动消息不是有效 JSON：{line}") from error
+            raise RuntimeError(f"AI 模型服务启动消息格式不正确：{line}") from error
         if not isinstance(data, dict):
-            raise RuntimeError(f"LLM 服务启动消息不是 JSON 对象：{data}")
+            raise RuntimeError(f"AI 模型服务启动消息格式不正确：{data}")
         return data
 
     def _stop_unready_process(self) -> None:
@@ -932,7 +938,7 @@ class LocalLlmExampleGenerator:
         )
         if len(models) > 1:
             names = "、".join(path.name for path in models)
-            raise RuntimeError(f"model 目录中只能存在一个 .gguf 模型文件。当前存在：{names}")
+            raise RuntimeError(f"本地模型文件夹中只能保留一个 .gguf 模型文件。当前存在：{names}")
         return models[0] if models else None
 
     @staticmethod
@@ -1141,7 +1147,7 @@ class LocalLlmExampleGenerator:
                 raise RuntimeError(f"没有检测到可用的 {requested.upper()} 加速设备。")
             if not supports_gpu_offload:
                 raise RuntimeError(
-                    "当前 llama-cpp-python 不支持 GPU offload。"
+                    "当前运行环境不支持 GPU 加速。"
                     f"请安装支持 {requested.upper()} 的 wheel，或设置 WORDPYCKET_LLM_DEVICE=cpu。"
                 )
             return requested

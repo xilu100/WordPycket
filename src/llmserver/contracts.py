@@ -26,6 +26,7 @@ class GeneratedExample:
 class GeneratedCorrection:
     corrected_word: str
     note: str = ""
+    should_update: bool = False
 
 
 @dataclass(frozen=True)

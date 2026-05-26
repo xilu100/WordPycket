@@ -248,7 +248,7 @@ class StudySessionController:
         self._history = []
         self._history_position = -1
         if self._mode == "review":
-            message = "复习池暂无词条。学习池中会 5 次或点击绝对会后会进入复习池。"
+            message = "复习池暂无词条。连续认识 5 次或点击“很熟”后，词条会进入复习池。"
         elif self._mode == "learning":
             message = "学习池暂无词条。"
         else:
@@ -303,11 +303,11 @@ class StudySessionController:
             meaning_text=entry.meaning,
             forms_text=f"词形: {entry.forms}" if entry.forms else "",
             example_text=f"例句: {entry.example_sentence}" if entry.example_sentence else "",
-            example_cn_text=f"例句中文: {entry.example_sentence_cn}" if entry.example_sentence_cn else "",
+            example_cn_text=f"例句翻译: {entry.example_sentence_cn}" if entry.example_sentence_cn else "",
             meta_text=(
                 f"{self._entry_index + 1} / {len(self._entries)} | "
                 f"频率 {entry.frequency} | {entry.status} | "
-                f"会 {entry.correct_count} / 不会 {entry.wrong_count}"
+                f"认识 {entry.correct_count} / 不认识 {entry.wrong_count}"
                 f"{learned_note}"
                 f"{history_note}"
             ),

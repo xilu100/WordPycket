@@ -1022,10 +1022,10 @@ class PdfVocabularyImporter:
         text = self.extract_text(self._pdf_path)
         self._report_progress("清洗文本并统计词频", 20)
         entries, language, schema = self.entries_from_text(text, self._max_entries)
-        self._report_progress("写入粗制 CSV", 35)
+        self._report_progress("生成 PDF 词表", 35)
         self.write_csv(entries, schema, self._csv_path)
         if self._vocabulary_cleaner is not None:
-            self._report_progress("AI 审阅粗制 CSV", 40)
+            self._report_progress("AI 检查 PDF 词表", 40)
             entries = self._vocabulary_cleaner.clean_pdf_vocabulary_entries(
                 entries,
                 language,
@@ -1033,8 +1033,8 @@ class PdfVocabularyImporter:
             )
             entries = self.reindex_entries(entries)
             if not entries:
-                raise RuntimeError("LLM 清理后没有保留可导入的词条。")
-            self._report_progress("写回 AI 清理后的 CSV", 85)
+                raise RuntimeError("AI 检查后没有保留可导入的词条。")
+            self._report_progress("保存 AI 检查结果", 85)
             self.write_csv(entries, schema, self._csv_path)
         self._report_progress("PDF 词表生成完成", 90)
         return PdfVocabularyImportResult(entries=entries, language=language, csv_path=self._csv_path)

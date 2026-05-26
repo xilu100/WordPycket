@@ -7,12 +7,15 @@ import sys
 import threading
 import time
 
+import pytest
+
 from wordpycket.domain.entities import WordEntry
 from pathlib import Path
 
 from llmserver.engine import LocalLlmExampleGenerator as LlmEngine
 from llmserver.server import JobStore, LlmRpcHandler
-from wordpycket.infrastructure.example_generator import GeneratedExample, LocalLlmExampleGenerator
+from wordpycket.infrastructure.example_generator import GeneratedCorrection, GeneratedExample, LocalLlmExampleGenerator
+from wordpycket.presentation.llm_jobs import ExplainCompleted
 from wordpycket.presentation.qt_app import WordPycketApp
 from wordpycket.presentation.qt_workers import BatchWorker
 
@@ -61,6 +64,14 @@ class GeneratorWithOneCrashedChild:
         raise NotImplementedError
 
 
+class CorrectionGenerator:
+    def __init__(self, corrections: dict[str, GeneratedCorrection]) -> None:
+        self._corrections = corrections
+
+    def correct_entry_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
+        return self._corrections[entry.word]
+
+
 def test_batch_worker_uses_bounded_isolated_generation_for_gui_stability() -> None:
     entries = [
         WordEntry(word="vector", meaning="向量"),
@@ -93,6 +104,47 @@ def test_batch_worker_keeps_running_when_one_isolated_generation_crashes() -> No
     assert {entry.word for entry, _generated in results} == {"vector", "matrix"}
     assert len(errors) == 1
     assert errors[0].startswith("crash: 模型子进程退出代码 -1073741819")
+
+
+def test_batch_worker_only_updates_corrections_when_model_reports_error() -> None:
+    entries = [
+        WordEntry(id="1", word="kernel", meaning="内核"),
+        WordEntry(id="2", word="machine_learning", meaning="机器学习"),
+    ]
+    generator = CorrectionGenerator(
+        {
+            "kernel": GeneratedCorrection("kernel", should_update=False),
+            "machine_learning": GeneratedCorrection("machine learning", should_update=True),
+        }
+    )
+    worker = BatchWorker("修正", entries, "", generator, lambda: "running")
+
+    result = worker._runner.run(lambda *_args: None)
+
+    assert result.errors == []
+    assert [(update.entry_id, update.first_value) for update in result.updates] == [("2", "machine learning")]
+
+
+def test_batch_worker_updates_meanings_from_translator() -> None:
+    class Translator:
+        def translate_meaning(self, entry: WordEntry, scope: str = "", language: str = "") -> str:
+            assert scope == ""
+            assert language == "英语"
+            return {"vector": "向量", "machine learning": "机器学习"}[entry.word]
+
+    entries = [
+        WordEntry(id="1", word="vector", meaning="适配器"),
+        WordEntry(id="2", word="machine learning", meaning=""),
+    ]
+    worker = BatchWorker("释义", entries, "", Translator(), lambda: "running", language="英语")
+
+    result = worker._runner.run(lambda *_args: None)
+
+    assert result.errors == []
+    assert sorted((update.entry_id, update.first_value, update.second_value) for update in result.updates) == [
+        ("1", "vector", "向量"),
+        ("2", "machine learning", "机器学习"),
+    ]
 
 
 def test_process_parallel_limit_override_is_bounded(monkeypatch) -> None:
@@ -268,7 +320,7 @@ def test_llm_server_without_ready_json_stops_waiting(monkeypatch) -> None:
     try:
         generator.generate(WordEntry(word="vector", meaning="向量"))
     except RuntimeError as error:
-        assert "ready JSON" in str(error)
+        assert "AI 模型服务" in str(error)
     else:
         raise AssertionError("LLM client should stop waiting when ready JSON is missing")
 
@@ -360,11 +412,11 @@ def test_pdf_cleanup_uses_cached_job_polling(monkeypatch) -> None:
     statuses = [
         {
             "state": "running",
-            "progress": {"message": "AI 审阅 CSV：已完成 1/2", "percent": 60},
+            "progress": {"message": "AI 检查词表：已完成 1/2", "percent": 60},
         },
         {
             "state": "completed",
-            "progress": {"message": "AI 审阅 CSV 完成", "percent": 80},
+            "progress": {"message": "AI 检查词表完成", "percent": 80},
             "result": [
                 {
                     "word": "vector",
@@ -396,16 +448,16 @@ def test_pdf_cleanup_uses_cached_job_polling(monkeypatch) -> None:
 
     assert calls[0][0] == "clean_pdf_vocabulary_entries"
     assert [entry.word for entry in cleaned] == ["vector"]
-    assert progress == [("AI 审阅 CSV：已完成 1/2", 60), ("AI 审阅 CSV 完成", 80)]
+    assert progress == [("AI 检查词表：已完成 1/2", 60), ("AI 检查词表完成", 80)]
 
 
 def test_local_job_timeout_is_based_on_idle_progress(monkeypatch) -> None:
     generator = LocalLlmExampleGenerator(Path("model"))
     now = 0.0
     statuses = [
-        {"state": "running", "progress": {"message": "AI 审阅 CSV：已完成 77/93", "percent": 73}},
-        {"state": "running", "progress": {"message": "AI 审阅 CSV：已完成 78/93", "percent": 73}},
-        {"state": "completed", "progress": {"message": "AI 审阅 CSV 完成", "percent": 80}, "result": []},
+        {"state": "running", "progress": {"message": "AI 检查词表：已完成 77/93", "percent": 73}},
+        {"state": "running", "progress": {"message": "AI 检查词表：已完成 78/93", "percent": 73}},
+        {"state": "completed", "progress": {"message": "AI 检查词表完成", "percent": 80}, "result": []},
     ]
 
     def fake_monotonic():
@@ -506,11 +558,37 @@ def test_gui_uses_supplement_batch_strategy() -> None:
         "parallelism": 1,
         "batch_size": 8,
     }
-    assert app._recommended_batch_strategy("修正") == {
+    assert app._recommended_batch_strategy("释义") == {
         "mode": "parallel",
         "parallelism": 4,
         "batch_size": 1,
     }
+
+
+def test_word_list_refresh_reloads_active_dataset() -> None:
+    active = Path("input/current.csv")
+    calls = []
+    app = object.__new__(WordPycketApp)
+    app._active_csv_loader = lambda: active
+    app._csv_switcher = lambda path: f"switched:{path.name}"
+    app._csv_task_thread = None
+    app._start_csv_task = lambda name, task: calls.append((name, task()))
+
+    app._refresh_current_dataset()
+
+    assert calls == [("refresh_csv", "switched:current.csv")]
+
+
+def test_word_list_refresh_falls_back_to_table_refresh_without_dataset_loader() -> None:
+    calls = []
+    app = object.__new__(WordPycketApp)
+    app._active_csv_loader = None
+    app._csv_switcher = None
+    app._refresh_words = lambda reload_current=True: calls.append(reload_current)
+
+    app._refresh_current_dataset()
+
+    assert calls == [False]
 
 
 def test_supplement_update_replaces_non_chinese_meaning() -> None:
@@ -544,6 +622,112 @@ def test_supplement_update_replaces_non_chinese_meaning() -> None:
 
     assert updated.meaning == "梯度"
     assert updated.example_sentence == "The gradient is calculated."
+
+
+def test_supplement_batch_applies_items_by_returned_entry_identity() -> None:
+    class Service:
+        def __init__(self, entries):
+            self.entries = {entry.id: entry for entry in entries}
+
+        def get_word(self, entry_id):
+            return self.entries.get(entry_id)
+
+        def update_examples(self, entry_id, example_sentence, example_sentence_cn):
+            entry = self.entries[entry_id]
+            updated = WordEntry(
+                id=entry.id,
+                source_index=entry.source_index,
+                word=entry.word,
+                meaning=entry.meaning,
+                forms=entry.forms,
+                example_sentence=example_sentence,
+                example_sentence_cn=example_sentence_cn,
+            )
+            self.entries[entry_id] = updated
+            return updated
+
+        def update_text(self, entry_id, word, meaning, forms):
+            entry = self.entries[entry_id]
+            updated = WordEntry(
+                id=entry.id,
+                source_index=entry.source_index,
+                word=word,
+                meaning=meaning,
+                forms=forms,
+                example_sentence=entry.example_sentence,
+                example_sentence_cn=entry.example_sentence_cn,
+            )
+            self.entries[entry_id] = updated
+            return updated
+
+    architecture = WordEntry(id="23", source_index=23, word="architecture", meaning="")
+    domain = WordEntry(id="24", source_index=24, word="domain", meaning="")
+    service = Service([architecture, domain])
+    app = object.__new__(WordPycketApp)
+    app._service = service
+    app._batch_updated_ids = []
+
+    app._apply_supplement_batch_result(
+        [architecture, domain],
+        {
+            "items": [
+                {
+                    "entry": {"source_index": 24, "word": "domain"},
+                    "example_sentence": "A domain defines the context.",
+                    "example_sentence_cn": "领域定义上下文。",
+                    "meaning": "领域",
+                },
+                {
+                    "entry": {"source_index": 23, "word": "architecture"},
+                    "example_sentence": "Architecture shapes the system.",
+                    "example_sentence_cn": "架构塑造系统。",
+                    "meaning": "架构",
+                },
+            ]
+        },
+    )
+
+    assert service.entries["23"].example_sentence == "Architecture shapes the system."
+    assert service.entries["23"].meaning == "架构"
+    assert service.entries["24"].example_sentence == "A domain defines the context."
+    assert service.entries["24"].meaning == "领域"
+
+
+def test_supplement_batch_rejects_unknown_returned_entry_identity() -> None:
+    architecture = WordEntry(id="23", source_index=23, word="architecture", meaning="")
+    app = object.__new__(WordPycketApp)
+
+    with pytest.raises(RuntimeError, match="词条不匹配"):
+        app._apply_supplement_batch_result(
+            [architecture],
+            {
+                "items": [
+                    {
+                        "entry": {"source_index": 24, "word": "domain"},
+                        "example_sentence": "A domain defines the context.",
+                        "example_sentence_cn": "领域定义上下文。",
+                    }
+                ]
+            },
+        )
+
+
+def test_supplement_batch_rejects_missing_returned_entry_identity() -> None:
+    architecture = WordEntry(id="23", source_index=23, word="architecture", meaning="")
+    app = object.__new__(WordPycketApp)
+
+    with pytest.raises(RuntimeError, match="缺少词条身份"):
+        app._apply_supplement_batch_result(
+            [architecture],
+            {
+                "items": [
+                    {
+                        "example_sentence": "Architecture shapes the system.",
+                        "example_sentence_cn": "架构塑造系统。",
+                    }
+                ]
+            },
+        )
 
 
 def test_idle_llm_close_closes_generator_only_when_idle() -> None:
@@ -644,6 +828,110 @@ def test_idle_llm_close_timer_cancels_during_next_job_and_reschedules_afterwards
     assert idle_timer.starts == 2
 
 
+def test_completed_explain_starts_idle_close_after_dialog_closes() -> None:
+    class Timer:
+        def __init__(self, active: bool = False) -> None:
+            self.active = active
+            self.starts = 0
+            self.stops = 0
+
+        def isActive(self) -> bool:
+            return self.active
+
+        def start(self) -> None:
+            self.starts += 1
+            self.active = True
+
+        def stop(self) -> None:
+            self.stops += 1
+            self.active = False
+
+    class Jobs:
+        def __init__(self) -> None:
+            self.idle = False
+            self.event = ExplainCompleted(WordEntry(word="vector", meaning="向量"), "向量解释")
+
+        def poll_explain(self):
+            event = self.event
+            self.event = None
+            return event
+
+        def poll_batch(self):
+            return []
+
+        def finish_explain(self) -> None:
+            self.idle = True
+
+        def is_idle(self) -> bool:
+            return self.idle
+
+    jobs = Jobs()
+    idle_timer = Timer()
+    app = object.__new__(WordPycketApp)
+    app._example_generator = object()
+    app._llm_jobs = jobs
+    app._llm_idle_close_timer = idle_timer
+    app._llm_poll_timer = Timer(active=True)
+    app._model_check_thread = None
+    app._pdf_import_thread = None
+    app._explain_current_study_button = None
+
+    def show_dialog(_word: str, _explanation: str) -> None:
+        assert idle_timer.starts == 0
+
+    app._show_explanation_dialog = show_dialog
+
+    app._poll_llm_jobs()
+
+    assert idle_timer.starts == 1
+
+
+def test_llm_polling_error_stops_timer_and_reports_once() -> None:
+    class Timer:
+        def __init__(self) -> None:
+            self.active = True
+            self.stops = 0
+
+        def isActive(self) -> bool:
+            return self.active
+
+        def stop(self) -> None:
+            self.stops += 1
+            self.active = False
+
+    class Jobs:
+        def __init__(self) -> None:
+            self.finished = 0
+            self.cleared = 0
+
+        def poll_explain(self):
+            raise RuntimeError("poll failed")
+
+        def finish_explain(self) -> None:
+            self.finished += 1
+
+        def clear_batch_jobs(self) -> None:
+            self.cleared += 1
+
+    jobs = Jobs()
+    timer = Timer()
+    messages = []
+    app = object.__new__(WordPycketApp)
+    app._example_generator = object()
+    app._llm_jobs = jobs
+    app._llm_poll_timer = timer
+    app._explain_current_study_button = None
+    app._batch_state = "idle"
+    app._show_error_message = lambda title, message: messages.append((title, message))
+
+    app._poll_llm_jobs()
+
+    assert timer.stops == 1
+    assert jobs.finished == 1
+    assert jobs.cleared == 1
+    assert messages == [("AI 任务失败", "poll failed")]
+
+
 def test_llm_job_store_runs_bounded_jobs_incrementally() -> None:
     store = JobStore(max_workers=2)
     started: queue.Queue[int] = queue.Queue()
@@ -672,6 +960,29 @@ def test_llm_job_store_runs_bounded_jobs_incrementally() -> None:
         threading.Event().wait(0.01)
 
     assert deadline.is_set()
+
+
+def test_llm_job_store_reuses_released_slot_for_sequential_jobs() -> None:
+    store = JobStore(max_workers=3)
+    used_slots = []
+
+    def target(_progress, slot):
+        used_slots.append(slot)
+        return {"slot": slot}
+
+    first = store.submit(target)
+    for _ in range(20):
+        if store.status(first)["state"] == "completed":
+            break
+        threading.Event().wait(0.01)
+
+    second = store.submit(target)
+    for _ in range(20):
+        if store.status(second)["state"] == "completed":
+            break
+        threading.Event().wait(0.01)
+
+    assert used_slots == [0, 0]
 
 
 def test_generate_batch_rpc_always_uses_single_model_slot() -> None:

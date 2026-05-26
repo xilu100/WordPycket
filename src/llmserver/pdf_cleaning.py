@@ -150,10 +150,15 @@ def truncate_for_prompt(value: str, limit: int) -> str:
 
 
 def build_pdf_vocabulary_cleaning_prompt(entries: list[WordEntry], language: str) -> str:
+    if language.strip() == "德语":
+        return build_german_pdf_vocabulary_cleaning_prompt(entries)
+    return build_english_pdf_vocabulary_cleaning_prompt(entries)
+
+
+def build_english_pdf_vocabulary_cleaning_prompt(entries: list[WordEntry]) -> str:
     rows = [csv_review_row(entry) for entry in entries]
     return (
-        "You are reviewing a rough vocabulary CSV generated from PDF text.\n"
-        f"Detected language: {language}\n"
+        "You are reviewing a rough English vocabulary CSV generated from PDF text.\n"
         "Rows are arrays: [csv_index, term, frequency, forms].\n"
         "For each row, decide whether term is a real learnable word or meaningful terminology phrase.\n"
         "Remove rows that are not learnable vocabulary terms, including:\n"
@@ -175,6 +180,39 @@ def build_pdf_vocabulary_cleaning_prompt(entries: list[WordEntry], language: str
         "Laplace, Hamiltonian, or Turing.\n"
         "Delete a name-derived term only when it is clearly just an author/person entry or bibliography residue. "
         "For example, remove Li, Hua, and Li Hua as person-name noise, but keep Bayes' theorem as a technical term.\n"
+        "Review only these CSV rows. Do not infer from the original PDF. "
+        "You will receive at most 100 rows in this batch. "
+        "Return only the csv_index values from the first column. Do not return batch row numbers. "
+        "Do not include reasons or explanations.\n"
+        "Return JSON only, exactly like: {\"remove_csv_indexes\": [101, 102]}. "
+        "Keep the JSON complete; if unsure, return an empty remove_csv_indexes array.\n"
+        f"CSV rows:\n{json.dumps(rows, ensure_ascii=False, separators=(',', ':'))}"
+    )
+
+
+def build_german_pdf_vocabulary_cleaning_prompt(entries: list[WordEntry]) -> str:
+    rows = [csv_review_row(entry) for entry in entries]
+    return (
+        "You are reviewing a rough German vocabulary CSV generated from PDF text.\n"
+        "Rows are arrays: [csv_index, term, frequency, forms].\n"
+        "For each row, decide whether term is a real learnable German word or meaningful German terminology phrase.\n"
+        "Remove rows that are not learnable German vocabulary terms, including:\n"
+        "- programming keywords or code/control-flow fragments such as if, else, endif, return, for, while;\n"
+        "- variable/function/class identifiers, camelCase/PascalCase/snake_case names, constants, library names, filenames, URLs, emails, or code fragments;\n"
+        "- file-like or app-like identifiers such as wordApp, tempScore, hasError, request_id, VECTOR_SIZE, JSONParserFactory;\n"
+        "- letter noise, OCR fragments, or non-words such as xy, abc, tmp, idx, foo, bar when they are not established terms;\n"
+        "- person names, full person names, author-list names, organization names, venue names, or bibliography artifacts;\n"
+        "- page/header/footer artifacts, citation markers, broken fragments, or table labels.\n"
+        "Keep rows that are real German words, academic terms, domain terms, abbreviations with established meaning, "
+        "German compounds, or meaningful fixed phrases, even if they are rare.\n"
+        "Keep ordinary German inflected vocabulary rows when the normalized term is a real word.\n"
+        "Keep German technical/software/domain vocabulary such as Vektor, Matrix, Ableitung, Gleichung, "
+        "Wahrscheinlichkeit, Verteilung, Modell, Netzwerk, Einbettung, Korpus, Abruf, Dienst, "
+        "Schnittstelle, Verarbeitung, Übersetzung, Ausrichtung, Häufigkeit, Wortschatz, and maschinelles Lernen.\n"
+        "Keep eponyms and name-derived technical terms when they are used as concepts, methods, or adjectives, "
+        "such as Bayes-Theorem, Fourier-Transformation, gaußsche Verteilung, newtonsch, eulersche, Markov, "
+        "Laplace, hamiltonsch, or Turing.\n"
+        "Delete a name-derived term only when it is clearly just an author/person entry or bibliography residue. "
         "Review only these CSV rows. Do not infer from the original PDF. "
         "You will receive at most 100 rows in this batch. "
         "Return only the csv_index values from the first column. Do not return batch row numbers. "

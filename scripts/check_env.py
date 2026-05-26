@@ -83,6 +83,7 @@ def project_dependencies() -> list[str]:
 
 def check_imports() -> list[str]:
     modules = (
+        "argostranslate",
         "wordpycket",
         "llmserver",
         "llama_cpp",
@@ -109,7 +110,10 @@ def check_nltk_data() -> list[str]:
     failures = []
     for resource in ("corpora/wordnet", "corpora/omw-1.4"):
         try:
-            nltk.data.find(resource)
+            try:
+                nltk.data.find(resource)
+            except LookupError:
+                nltk.data.find(f"{resource}.zip")
         except LookupError:
             failures.append(f"Missing NLTK data: {resource}")
     return failures

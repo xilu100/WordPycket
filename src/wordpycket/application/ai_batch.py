@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import time
+import inspect
 from collections.abc import Callable
 from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from dataclasses import dataclass
@@ -46,12 +47,14 @@ class AiBatchRunner:
         scope: str,
         generator: ExampleGenerator,
         control: ControlState,
+        language: str = "",
         parallel_limit: int | None = None,
         sleep: SleepCallback = time.sleep,
     ) -> None:
         self._action = action
         self._entries = entries
         self._scope = scope
+        self._language = language
         self._generator = generator
         self._control = control
         self._parallel_limit = parallel_limit
@@ -70,13 +73,32 @@ class AiBatchRunner:
                         generated.meaning,
                     )
                 )
-        else:
-            results, errors, _workers = self.correct(progress)
-            for entry, corrected in results:
+        elif self._action == "释义":
+            results, errors, _workers = self.meaning(progress)
+            for entry, meaning in results:
+                cleaned = meaning.strip()
+                if not cleaned:
+                    continue
                 updates.append(
                     BatchUpdate(
                         entry.id,
-                        corrected.corrected_word,
+                        entry.word,
+                        cleaned,
+                        entry.forms,
+                    )
+                )
+        else:
+            results, errors, _workers = self.correct(progress)
+            for entry, corrected in results:
+                if not getattr(corrected, "should_update", True):
+                    continue
+                corrected_word = corrected.corrected_word.strip()
+                if not corrected_word or corrected_word == entry.word.strip():
+                    continue
+                updates.append(
+                    BatchUpdate(
+                        entry.id,
+                        corrected_word,
                         entry.meaning,
                         entry.forms,
                     )
@@ -93,6 +115,9 @@ class AiBatchRunner:
             return self._run_bounded("correct_entry_isolated", progress)
         return self._run_bounded("correct_entry", progress)
 
+    def meaning(self, progress: ProgressCallback):
+        return self._run_bounded("translate_meaning", progress)
+
     def _run_bounded(self, method_name: str, progress: ProgressCallback):
         if not self._entries:
             return [], [], 0
@@ -108,7 +133,7 @@ class AiBatchRunner:
         def run_entry(entry: WordEntry):
             method = getattr(self._generator, method_name)
             try:
-                return entry, method(entry, self._scope)
+                return entry, self._call_generator_method(method, entry)
             except Exception as error:
                 raise RuntimeError(f"{entry.word}: {error}") from error
 
@@ -140,6 +165,23 @@ class AiBatchRunner:
                 while len(active) < worker_count and submit_next(executor):
                     pass
         return results, errors, worker_count
+
+    def _call_generator_method(self, method, entry: WordEntry):
+        signature = inspect.signature(method)
+        if any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in signature.parameters.values()):
+            return method(entry, self._scope, self._language)
+        positional_count = sum(
+            1
+            for parameter in signature.parameters.values()
+            if parameter.kind
+            in {
+                inspect.Parameter.POSITIONAL_ONLY,
+                inspect.Parameter.POSITIONAL_OR_KEYWORD,
+            }
+        )
+        if positional_count >= 3:
+            return method(entry, self._scope, self._language)
+        return method(entry, self._scope)
 
     def _wait_for_resume(self) -> bool:
         while self._control() == "paused":

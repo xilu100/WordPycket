@@ -203,7 +203,7 @@ def test_run_pdf_import_isolated_uses_child_when_cleaner_supports_pdf_payload(tm
             self.stdin = FakeStdin()
             self.stdout = iter(
                 [
-                    json.dumps({"type": "progress", "message": "AI 审阅 CSV：1/2", "percent": 40}) + "\n",
+                    json.dumps({"type": "progress", "message": "AI 检查词表：1/2", "percent": 40}) + "\n",
                     json.dumps({"type": "result", "language": "英语", "csv_path": str(tmp_path / "words.csv")}) + "\n",
                 ]
             )
@@ -223,7 +223,7 @@ def test_run_pdf_import_isolated_uses_child_when_cleaner_supports_pdf_payload(tm
     )
 
     assert result.language == "英语"
-    assert progress == [("AI 审阅 CSV：1/2", 40)]
+    assert progress == [("AI 检查词表：1/2", 40)]
     process = created_processes[0]
     assert process.kwargs["env"]["WORDPYCKET_PDF_CHILD"] == "1"
     assert json.loads(process.stdin.value)["use_llm_cleanup"] is True

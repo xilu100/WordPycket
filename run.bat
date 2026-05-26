@@ -10,12 +10,17 @@ if not exist "%LOG_DIR%" mkdir "%LOG_DIR%" >nul 2>&1
 >>"%LAUNCHER_LOG%" echo.
 >>"%LAUNCHER_LOG%" echo ==== WordPycket launcher %date% %time% ====
 
-powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%run.ps1" >>"%LAUNCHER_LOG%" 2>&1
+echo Starting WordPycket...
+echo First launch may install Python packages and can take several minutes.
+echo Detailed logs are saved in: "%LOG_DIR%"
+echo.
+
+powershell -NoProfile -ExecutionPolicy Bypass -File "%ROOT%run.ps1"
 set "EXIT_CODE=%ERRORLEVEL%"
 if not "%EXIT_CODE%"=="0" (
     echo.
     echo WordPycket failed to start.
-    echo Startup log saved to: "%LAUNCHER_LOG%"
+    echo Startup log saved in: "%LOG_DIR%"
     echo Press any key to close.
     pause >nul
     exit /b %EXIT_CODE%

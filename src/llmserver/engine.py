@@ -60,35 +60,44 @@ class LocalLlmExampleGenerator:
         self._recommended_process_parallelism: int | None = None
         self._parallel_worker_count: int | None = None
 
-    def generate(self, entry: WordEntry, scope: str = "") -> GeneratedExample:
+    def generate(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExample:
         llm = self._load_model(0)
-        prompt = self._build_prompt(entry, scope)
-        content = self._call_model(llm, prompt)
-        return self._parse_response(content, require_meaning=not entry.meaning.strip())
+        prompt = self._build_prompt(entry, scope, language)
+        require_meaning = prompts.needs_chinese_meaning(entry)
+        content = self._call_generation_model(llm, prompt, language)
+        try:
+            return self._parse_response(content, require_meaning=require_meaning, language=language, entry=entry)
+        except RuntimeError as error:
+            if not self._should_retry_generation_parse(error):
+                raise
+            retry_prompt = self._retry_generation_prompt(prompt, content, language)
+            retry_content = self._call_generation_model(llm, retry_prompt, language)
+            return self._parse_response(retry_content, require_meaning=require_meaning, language=language, entry=entry)
 
-    def generate_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedExample:
+    def generate_isolated(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExample:
         if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
-            return self.generate(entry, scope)
-        data = self._run_isolated_worker("generate", entry, scope)
+            return self.generate(entry, scope, language)
+        data = self._run_isolated_worker("generate", entry, scope, language)
         return GeneratedExample(
             example_sentence=str(data["example_sentence"]),
             example_sentence_cn=str(data["example_sentence_cn"]),
             meaning=str(data.get("meaning", "")),
         )
 
-    def correct_entry(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
+    def correct_entry(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedCorrection:
         llm = self._load_model(0)
-        prompt = self._build_correction_prompt(entry, scope)
+        prompt = self._build_correction_prompt(entry, scope, language)
         content = self._call_model(llm, prompt)
         return self._parse_correction_response(content, entry)
 
-    def correct_entry_isolated(self, entry: WordEntry, scope: str = "") -> GeneratedCorrection:
+    def correct_entry_isolated(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedCorrection:
         if os.getenv("WORDPYCKET_LLM_CHILD") == "1":
-            return self.correct_entry(entry, scope)
-        data = self._run_isolated_worker("correct", entry, scope)
+            return self.correct_entry(entry, scope, language)
+        data = self._run_isolated_worker("correct", entry, scope, language)
         return GeneratedCorrection(
             corrected_word=str(data["corrected_word"]),
             note=str(data.get("note", "")),
+            should_update=bool(data.get("should_update", False)),
         )
 
     def explain_entry(self, entry: WordEntry, scope: str = "", language: str = "") -> GeneratedExplanation:
@@ -97,7 +106,7 @@ class LocalLlmExampleGenerator:
         content = self._call_model(
             llm,
             prompt,
-            system_prompt="You explain target-language vocabulary usage for Chinese learners. Return only valid JSON.",
+            system_prompt=self._explanation_system_prompt(language),
             max_tokens=self._explanation_max_tokens(),
         )
         return self._parse_explanation_response(content)
@@ -120,7 +129,7 @@ class LocalLlmExampleGenerator:
         content = self._call_model(
             llm,
             prompt,
-            system_prompt="You explain target-language vocabulary usage for Chinese learners. Return only valid JSON.",
+            system_prompt=self._explanation_system_prompt(language),
             max_tokens=self._explanation_max_tokens(),
         )
         return self._parse_explanation_response(content)
@@ -131,11 +140,17 @@ class LocalLlmExampleGenerator:
         scope: str = "",
         progress: ProgressCallback | None = None,
         control: ControlCallback | None = None,
+        language: str = "",
     ) -> tuple[list[tuple[WordEntry, GeneratedExample]], list[str], int]:
-        return self._run_parallel(entries, self._generate_with_slot, scope, progress, control)
+        return self._run_parallel(entries, self._generate_with_slot, scope, progress, control, language)
 
-    def generate_batch(self, entries: list[WordEntry], scope: str = "") -> list[tuple[WordEntry, GeneratedExample]]:
-        return self._generate_batch_with_slot(0, entries, scope)
+    def generate_batch(
+        self,
+        entries: list[WordEntry],
+        scope: str = "",
+        language: str = "",
+    ) -> list[tuple[WordEntry, GeneratedExample]]:
+        return self._generate_batch_with_slot(0, entries, scope, language)
 
     def correct_many(
         self,
@@ -143,8 +158,9 @@ class LocalLlmExampleGenerator:
         scope: str = "",
         progress: ProgressCallback | None = None,
         control: ControlCallback | None = None,
+        language: str = "",
     ) -> tuple[list[tuple[WordEntry, GeneratedCorrection]], list[str], int]:
-        return self._run_parallel(entries, self._correct_with_slot, scope, progress, control)
+        return self._run_parallel(entries, self._correct_with_slot, scope, progress, control, language)
 
     def is_available(self) -> bool:
         return self._find_existing_model_path() is not None
@@ -410,7 +426,7 @@ class LocalLlmExampleGenerator:
 
             model_path = self._ensure_model_path()
             if model_path is None:
-                raise RuntimeError("model 目录中没有找到 .gguf 模型文件。")
+                raise RuntimeError("本地模型文件夹中没有找到 .gguf 模型文件。")
 
             try:
                 from llama_cpp import Llama
@@ -450,6 +466,7 @@ class LocalLlmExampleGenerator:
         scope: str,
         progress: ProgressCallback | None,
         control: ControlCallback | None,
+        language: str = "",
     ):
         if not entries:
             return [], [], 0
@@ -484,7 +501,7 @@ class LocalLlmExampleGenerator:
                 return False
             entry = entries[next_index]
             next_index += 1
-            active.add(executor.submit(self._run_with_slot, slots, worker, entry, scope))
+            active.add(executor.submit(self._run_with_slot, slots, worker, entry, scope, language))
             return True
 
         with ThreadPoolExecutor(max_workers=worker_count) as executor:
@@ -517,10 +534,11 @@ class LocalLlmExampleGenerator:
         worker: Any,
         entry: WordEntry,
         scope: str = "",
+        language: str = "",
     ):
         slot = slots.get()
         try:
-            return worker(slot, entry, scope)
+            return worker(slot, entry, scope, language)
         except Exception as error:
             raise RuntimeError(f"{entry.word}: {error}") from error
         finally:
@@ -531,38 +549,58 @@ class LocalLlmExampleGenerator:
         slot: int,
         entry: WordEntry,
         scope: str = "",
+        language: str = "",
     ) -> tuple[WordEntry, GeneratedExample]:
         llm = self._load_model(slot)
-        prompt = self._build_prompt(entry, scope)
-        content = self._call_model(llm, prompt)
-        return entry, self._parse_response(content, require_meaning=not entry.meaning.strip())
+        prompt = self._build_prompt(entry, scope, language)
+        require_meaning = prompts.needs_chinese_meaning(entry)
+        content = self._call_generation_model(llm, prompt, language)
+        try:
+            return entry, self._parse_response(content, require_meaning=require_meaning, language=language, entry=entry)
+        except RuntimeError as error:
+            if not self._should_retry_generation_parse(error):
+                raise
+            retry_prompt = self._retry_generation_prompt(prompt, content, language)
+            retry_content = self._call_generation_model(llm, retry_prompt, language)
+            return entry, self._parse_response(retry_content, require_meaning=require_meaning, language=language, entry=entry)
 
     def _generate_batch_with_slot(
         self,
         slot: int,
         entries: list[WordEntry],
         scope: str = "",
+        language: str = "",
     ) -> list[tuple[WordEntry, GeneratedExample]]:
         llm = self._load_model(slot)
-        return self._generate_batch_with_llm(llm, entries, scope)
+        return self._generate_batch_with_llm(llm, entries, scope, language)
 
     def _generate_batch_with_llm(
         self,
         llm: Any,
         entries: list[WordEntry],
         scope: str = "",
+        language: str = "",
     ) -> list[tuple[WordEntry, GeneratedExample]]:
-        prompt = self._build_batch_prompt(entries, scope)
-        content = self._call_model(llm, prompt, max_tokens=self._batch_max_tokens(len(entries)))
+        prompt = self._build_batch_prompt(entries, scope, language)
+        max_tokens = self._batch_max_tokens(len(entries))
+        content = self._call_generation_model(llm, prompt, language, max_tokens=max_tokens)
         try:
-            return self._parse_batch_response(content, entries)
-        except Exception:
+            return self._parse_batch_response(content, entries, language)
+        except Exception as error:
+            if self._should_retry_generation_parse(error):
+                retry_prompt = self._retry_generation_prompt(prompt, content, language)
+                retry_content = self._call_generation_model(llm, retry_prompt, language, max_tokens=max_tokens)
+                try:
+                    return self._parse_batch_response(retry_content, entries, language)
+                except Exception:
+                    if len(entries) <= 1:
+                        raise
             if len(entries) <= 1:
                 raise
             midpoint = max(1, len(entries) // 2)
             return [
-                *self._generate_batch_with_llm(llm, entries[:midpoint], scope),
-                *self._generate_batch_with_llm(llm, entries[midpoint:], scope),
+                *self._generate_batch_with_llm(llm, entries[:midpoint], scope, language),
+                *self._generate_batch_with_llm(llm, entries[midpoint:], scope, language),
             ]
 
     def _correct_with_slot(
@@ -570,9 +608,10 @@ class LocalLlmExampleGenerator:
         slot: int,
         entry: WordEntry,
         scope: str = "",
+        language: str = "",
     ) -> tuple[WordEntry, GeneratedCorrection]:
         llm = self._load_model(slot)
-        prompt = self._build_correction_prompt(entry, scope)
+        prompt = self._build_correction_prompt(entry, scope, language)
         content = self._call_model(llm, prompt)
         return entry, self._parse_correction_response(content, entry)
 
@@ -794,7 +833,7 @@ class LocalLlmExampleGenerator:
                 raise RuntimeError(f"没有检测到可用的 {requested.upper()} 加速设备。")
             if not supports_gpu_offload:
                 raise RuntimeError(
-                    "当前 llama-cpp-python 不支持 GPU offload。"
+                    "当前运行环境不支持 GPU 加速。"
                     f"请安装支持 {requested.upper()} 的 wheel，或设置 WORDPYCKET_LLM_DEVICE=cpu。"
                 )
             return requested
@@ -932,20 +971,20 @@ class LocalLlmExampleGenerator:
                     try:
                         removed_indexes.update(future.result() - protected_indexes)
                     except Exception as error:
-                        message = f"AI 审阅 CSV：第 {batch_number}/{total_batches} 批失败，已保留该批原始词条。{error}"
+                        message = f"AI 检查词表：第 {batch_number}/{total_batches} 批失败，已保留该批原始词条。{error}"
                         batch_errors.append(message)
                         LOGGER.exception(message)
                     completed += 1
                     if progress_callback is not None:
                         percent = 40 + int(completed / max(1, total_batches) * 40)
-                        progress_callback(f"AI 审阅 CSV：已完成 {completed}/{total_batches}", percent)
+                        progress_callback(f"AI 检查词表：已完成 {completed}/{total_batches}", percent)
                 while len(active) < worker_count and submit_next(executor):
                     pass
         if progress_callback is not None:
             if batch_errors:
-                progress_callback(f"AI 审阅 CSV 完成，{len(batch_errors)} 批失败并已保留", 80)
+                progress_callback(f"AI 检查词表完成，{len(batch_errors)} 批失败并已保留", 80)
             else:
-                progress_callback("AI 审阅 CSV 完成", 80)
+                progress_callback("AI 检查词表完成", 80)
         return [
             WordEntry(
                 word=entry.word,
@@ -1075,6 +1114,54 @@ class LocalLlmExampleGenerator:
     ) -> str:
         return llama_runtime.call_model(llm, prompt, system_prompt, max_tokens)
 
+    @classmethod
+    def _call_generation_model(
+        cls,
+        llm: Any,
+        prompt: str,
+        language: str = "",
+        max_tokens: int = 200,
+    ) -> str:
+        return cls._call_model(
+            llm,
+            prompt,
+            system_prompt=cls._generation_system_prompt(language),
+            max_tokens=max_tokens,
+        )
+
+    @staticmethod
+    def _generation_system_prompt(language: str = "") -> str:
+        if language.strip() == "德语":
+            return (
+                "You generate German vocabulary examples for Chinese learners. "
+                "Return only valid JSON. The JSON field example_sentence must be German only "
+                "with no Chinese characters. The JSON field example_sentence_cn must be Simplified Chinese."
+            )
+        return (
+            "You generate English vocabulary examples for Chinese learners. "
+            "Return only valid JSON. The JSON field example_sentence must be English only "
+            "with no Chinese characters. The JSON field example_sentence_cn must be Simplified Chinese."
+        )
+
+    @staticmethod
+    def _should_retry_generation_parse(error: Exception) -> bool:
+        message = str(error)
+        return "例句不是" in message or "缺少中文释义" in message or "缺少例句字段" in message
+
+    @classmethod
+    def _retry_generation_prompt(cls, original_prompt: str, invalid_content: str, language: str = "") -> str:
+        target = "German" if language.strip() == "德语" else "English"
+        return (
+            f"{original_prompt}\n\n"
+            "The previous JSON response was invalid:\n"
+            f"{invalid_content}\n\n"
+            "Return the JSON again with these corrections:\n"
+            f"- example_sentence must be {target} only and must not contain Chinese characters.\n"
+            "- example_sentence_cn must be Simplified Chinese only.\n"
+            "- If the input item has needs_meaning true or lacks a Chinese meaning, meaning must be a short Simplified Chinese word or phrase.\n"
+            "- Return only valid JSON."
+        )
+
     def _run_smoke_test(self) -> None:
         llm = self._load_model(0)
         content = self._call_smoke_model(llm)
@@ -1125,16 +1212,16 @@ class LocalLlmExampleGenerator:
         return model_store.acquire_download_lock(lock_path, target_path)
 
     @staticmethod
-    def _build_prompt(entry: WordEntry, scope: str = "") -> str:
-        return prompts.build_prompt(entry, scope)
+    def _build_prompt(entry: WordEntry, scope: str = "", language: str = "") -> str:
+        return prompts.build_prompt(entry, scope, language)
 
     @staticmethod
-    def _build_batch_prompt(entries: list[WordEntry], scope: str = "") -> str:
-        return prompts.build_batch_prompt(entries, scope)
+    def _build_batch_prompt(entries: list[WordEntry], scope: str = "", language: str = "") -> str:
+        return prompts.build_batch_prompt(entries, scope, language)
 
     @staticmethod
-    def _build_correction_prompt(entry: WordEntry, scope: str = "") -> str:
-        return prompts.build_correction_prompt(entry, scope)
+    def _build_correction_prompt(entry: WordEntry, scope: str = "", language: str = "") -> str:
+        return prompts.build_correction_prompt(entry, scope, language)
 
     @staticmethod
     def _build_explanation_prompt(entry: WordEntry, scope: str = "", language: str = "") -> str:
@@ -1149,12 +1236,21 @@ class LocalLlmExampleGenerator:
         return prompts.normalize_english_term(text)
 
     @staticmethod
-    def _parse_response(content: str, require_meaning: bool = False) -> GeneratedExample:
-        return prompts.parse_response(content, require_meaning)
+    def _parse_response(
+        content: str,
+        require_meaning: bool = False,
+        language: str = "",
+        entry: WordEntry | None = None,
+    ) -> GeneratedExample:
+        return prompts.parse_response(content, require_meaning, language, entry)
 
     @staticmethod
-    def _parse_batch_response(content: str, entries: list[WordEntry]) -> list[tuple[WordEntry, GeneratedExample]]:
-        return prompts.parse_batch_response(content, entries)
+    def _parse_batch_response(
+        content: str,
+        entries: list[WordEntry],
+        language: str = "",
+    ) -> list[tuple[WordEntry, GeneratedExample]]:
+        return prompts.parse_batch_response(content, entries, language)
 
     @staticmethod
     def _batch_max_tokens(entry_count: int) -> int:
@@ -1169,6 +1265,12 @@ class LocalLlmExampleGenerator:
             except ValueError as error:
                 raise RuntimeError("WORDPYCKET_LLM_EXPLAIN_TOKENS 必须是整数。") from error
         return 768
+
+    @staticmethod
+    def _explanation_system_prompt(language: str = "") -> str:
+        if language.strip() == "德语":
+            return "You explain German vocabulary usage for Chinese learners. Return only valid JSON."
+        return "You explain English vocabulary usage for Chinese learners. Return only valid JSON."
 
     @staticmethod
     def _parse_correction_response(
@@ -1199,7 +1301,7 @@ def _main() -> None:
     scope = str(payload.get("scope", ""))
     language = str(payload.get("language", ""))
     if action == "generate":
-        generated = generator.generate(entry, scope)
+        generated = generator.generate(entry, scope, language)
         result = {
             "example_sentence": generated.example_sentence,
             "example_sentence_cn": generated.example_sentence_cn,
@@ -1207,10 +1309,11 @@ def _main() -> None:
         if generated.meaning:
             result["meaning"] = generated.meaning
     elif action == "correct":
-        corrected = generator.correct_entry(entry, scope)
+        corrected = generator.correct_entry(entry, scope, language)
         result = {
             "corrected_word": corrected.corrected_word,
             "note": corrected.note,
+            "should_update": corrected.should_update,
         }
     elif action == "explain":
         explained = generator.explain_entry(entry, scope, language)
@@ -1219,7 +1322,7 @@ def _main() -> None:
         generator._run_smoke_test()
         result = {"ok": True}
     else:
-        raise RuntimeError(f"未知智能任务：{action}")
+        raise RuntimeError(f"未知 AI 任务：{action}")
     print(json.dumps(result, ensure_ascii=False), flush=True)
 
 

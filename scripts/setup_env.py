@@ -181,6 +181,10 @@ def has_mps_device() -> bool:
 
 
 def install_llama_cpp(python: Path, device: str, strict_accel: bool) -> None:
+    if python_module_available(python, "llama_cpp"):
+        print("llama-cpp-python is already installed; skipping.")
+        return
+
     if device == "cpu":
         print("Installing CPU llama-cpp-python wheel.")
         install_llama_cpu(python)
@@ -225,7 +229,7 @@ def install_llama_cpp(python: Path, device: str, strict_accel: bool) -> None:
 
 
 def install_llama_cpu(python: Path) -> None:
-    run([str(python), "-m", "pip", "install", "--upgrade", "--force-reinstall", "llama-cpp-python>=0.3.0"])
+    run([str(python), "-m", "pip", "install", "--upgrade", "llama-cpp-python>=0.3.0"])
 
 
 def install_llama_cuda_prebuilt(python: Path) -> bool:
@@ -303,7 +307,24 @@ def install_spacy_models(python: Path, model_selection: str) -> None:
         model = SPACY_MODELS.get(language)
         if model is None:
             raise RuntimeError(f"Unsupported spaCy model language: {language}")
+        if python_module_available(python, model):
+            print(f"spaCy model {model} is already installed; skipping.")
+            continue
         run([str(python), "-m", "spacy", "download", model])
+
+
+def python_module_available(python: Path, module: str) -> bool:
+    result = subprocess.run(
+        [
+            str(python),
+            "-c",
+            "import importlib.util, sys; sys.exit(0 if importlib.util.find_spec(sys.argv[1]) else 1)",
+            module,
+        ],
+        cwd=PROJECT_ROOT,
+        check=False,
+    )
+    return result.returncode == 0
 
 
 def run(command: list[str], env: dict[str, str] | None = None) -> None:

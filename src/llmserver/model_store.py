@@ -20,7 +20,7 @@ def find_existing_model_path(model_dir: Path, default_filename: str) -> Path | N
     )
     if len(models) > 1:
         names = "、".join(path.name for path in models)
-        raise RuntimeError(f"model 目录中只能存在一个 .gguf 模型文件。当前存在：{names}")
+        raise RuntimeError(f"本地模型文件夹中只能保留一个 .gguf 模型文件。当前存在：{names}")
     return models[0] if models else None
 
 

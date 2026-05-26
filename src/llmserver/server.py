@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import argparse
 import concurrent.futures
+import inspect
 import json
 import queue
 import sys
@@ -39,6 +40,24 @@ def _entry_to_payload(entry: WordEntry) -> dict[str, Any]:
     }
 
 
+def _call_with_optional_language(method: Any, *args: Any, language: str = "") -> Any:
+    signature = inspect.signature(method)
+    if any(parameter.kind == inspect.Parameter.VAR_POSITIONAL for parameter in signature.parameters.values()):
+        return method(*args, language)
+    positional_count = sum(
+        1
+        for parameter in signature.parameters.values()
+        if parameter.kind
+        in {
+            inspect.Parameter.POSITIONAL_ONLY,
+            inspect.Parameter.POSITIONAL_OR_KEYWORD,
+        }
+    )
+    if positional_count > len(args):
+        return method(*args, language)
+    return method(*args)
+
+
 def _jsonable(value: Any) -> Any:
     if isinstance(value, Path):
         return str(value)
@@ -57,8 +76,8 @@ class JobStore:
     def __init__(self, max_workers: int) -> None:
         self._max_workers = max(1, max_workers)
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers)
-        self._slots: queue.Queue[int] = queue.Queue()
-        for slot in range(self._max_workers):
+        self._slots: queue.LifoQueue[int] = queue.LifoQueue()
+        for slot in reversed(range(self._max_workers)):
             self._slots.put(slot)
         self._lock = threading.Lock()
         self._jobs: dict[str, dict[str, Any]] = {}
@@ -80,11 +99,11 @@ class JobStore:
         with self._lock:
             job = self._jobs.get(job_id)
             if job is None:
-                raise RuntimeError(f"Unknown LLM job: {job_id}")
+                raise RuntimeError(f"未知 AI 任务：{job_id}")
             return _jsonable(dict(job))
 
     def _run(self, job_id: str, target: Callable[[Callable[[str, int], None], int], Any]) -> None:
-        self._update(job_id, state="running", stage="running", progress={"message": "LLM 正在处理", "percent": 1})
+        self._update(job_id, state="running", stage="running", progress={"message": "AI 正在处理", "percent": 1})
 
         def progress(message: str, percent: int) -> None:
             self._update(
@@ -101,7 +120,7 @@ class JobStore:
                 job_id,
                 state="failed",
                 stage="failed",
-                progress={"message": "LLM 任务失败", "percent": 100},
+                progress={"message": "AI 任务失败", "percent": 100},
                 error=str(error),
             )
             return
@@ -111,7 +130,7 @@ class JobStore:
             job_id,
             state="completed",
             stage="completed",
-            progress={"message": "LLM 任务完成", "percent": 100},
+            progress={"message": "AI 任务完成", "percent": 100},
             result=_jsonable(result),
         )
 
@@ -189,10 +208,22 @@ class LlmRpcHandler(BaseHTTPRequestHandler):
     ) -> Any:
         if method == "generate":
             entry = _entry_from_payload(params["entry"])
-            return self.generator._generate_with_slot(slot, entry, str(params.get("scope", "")))[1]
+            return _call_with_optional_language(
+                self.generator._generate_with_slot,
+                slot,
+                entry,
+                str(params.get("scope", "")),
+                language=str(params.get("language", "")),
+            )[1]
         if method == "generate_batch":
             entries = [_entry_from_payload(item) for item in params.get("entries", [])]
-            generated = self.generator._generate_batch_with_slot(0, entries, str(params.get("scope", "")))
+            generated = _call_with_optional_language(
+                self.generator._generate_batch_with_slot,
+                0,
+                entries,
+                str(params.get("scope", "")),
+                language=str(params.get("language", "")),
+            )
             return [
                 {
                     "entry": _entry_to_payload(item_entry),
@@ -204,7 +235,13 @@ class LlmRpcHandler(BaseHTTPRequestHandler):
             ]
         if method == "correct_entry":
             entry = _entry_from_payload(params["entry"])
-            return self.generator._correct_with_slot(slot, entry, str(params.get("scope", "")))[1]
+            return _call_with_optional_language(
+                self.generator._correct_with_slot,
+                slot,
+                entry,
+                str(params.get("scope", "")),
+                language=str(params.get("language", "")),
+            )[1]
         if method == "explain_entry":
             return self.generator._explain_with_slot(
                 slot,
@@ -238,7 +275,7 @@ class LlmRpcHandler(BaseHTTPRequestHandler):
                 progress_callback=progress_callback,
             )
             return [_entry_to_payload(entry) for entry in cleaned]
-        raise RuntimeError(f"Unknown LLM RPC method: {method}")
+        raise RuntimeError(f"未知 AI 方法：{method}")
 
     def _run_action(self, params: dict[str, Any], slot: int = 0) -> dict[str, Any]:
         action = str(params.get("action", ""))
@@ -246,7 +283,13 @@ class LlmRpcHandler(BaseHTTPRequestHandler):
         language = str(params.get("language", ""))
         if action == "generate_batch":
             entries = [_entry_from_payload(item) for item in params.get("entries", [])]
-            generated = self.generator._generate_batch_with_slot(0, entries, scope)
+            generated = _call_with_optional_language(
+                self.generator._generate_batch_with_slot,
+                0,
+                entries,
+                scope,
+                language=language,
+            )
             return {
                 "items": [
                     {
@@ -260,7 +303,13 @@ class LlmRpcHandler(BaseHTTPRequestHandler):
             }
         entry = _entry_from_payload(params["entry"])
         if action == "generate":
-            generated = self.generator._generate_with_slot(slot, entry, scope)[1]
+            generated = _call_with_optional_language(
+                self.generator._generate_with_slot,
+                slot,
+                entry,
+                scope,
+                language=language,
+            )[1]
             result = {
                 "example_sentence": generated.example_sentence,
                 "example_sentence_cn": generated.example_sentence_cn,
@@ -269,15 +318,25 @@ class LlmRpcHandler(BaseHTTPRequestHandler):
                 result["meaning"] = generated.meaning
             return result
         if action == "correct":
-            corrected = self.generator._correct_with_slot(slot, entry, scope)[1]
-            return {"corrected_word": corrected.corrected_word, "note": corrected.note}
+            corrected = _call_with_optional_language(
+                self.generator._correct_with_slot,
+                slot,
+                entry,
+                scope,
+                language=language,
+            )[1]
+            return {
+                "corrected_word": corrected.corrected_word,
+                "note": corrected.note,
+                "should_update": corrected.should_update,
+            }
         if action == "explain":
             explained = self.generator._explain_with_slot(slot, entry, scope, language)
             return {"explanation": explained.explanation}
         if action == "smoke_test":
             self.generator._run_smoke_test()
             return {"ok": True}
-        raise RuntimeError(f"未知智能任务：{action}")
+        raise RuntimeError(f"未知 AI 任务：{action}")
 
 
 def main() -> None:

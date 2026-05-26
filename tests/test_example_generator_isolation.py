@@ -11,6 +11,7 @@ import pytest
 
 from wordpycket.domain.entities import WordEntry
 from llmserver.engine import LocalLlmExampleGenerator
+from llmserver import prompts
 from wordpycket.infrastructure.example_generator import LocalLlmExampleGenerator as ClientLlmExampleGenerator
 
 
@@ -121,16 +122,60 @@ def test_explanation_prompt_targets_vocabulary_language_not_chinese_translation(
 
     assert "Target vocabulary language: 德语" in prompt
     assert "exactly three labeled sections: 意思, 常规用法, 领域用法" in prompt
-    assert "In 意思, give the meaning of the target word or phrase itself" in prompt
+    assert "In 意思, give the meaning of the German word or phrase itself" in prompt
     assert "In 常规用法, write the explanation in Chinese" in prompt
-    assert "explicitly explain the English usage of the target word or phrase" in prompt
-    assert "common English collocations" in prompt
+    assert "explicitly explain the German usage of the target word or phrase" in prompt
+    assert "common German collocations" in prompt
     assert "In 领域用法, write the explanation in Chinese" in prompt
-    assert "common English technical collocations or term patterns" in prompt
+    assert "common German technical collocations or term patterns" in prompt
     assert "Required domain for domain-specific usage: 医学" in prompt
     assert "Do not explain how the Chinese translation is used in Chinese" in prompt
-    assert "both sections must mention target-language/English usage" in prompt
+    assert "both sections must mention German usage" in prompt
     assert "only a reference to disambiguate the vocabulary item" in prompt
+    assert "English usage" not in prompt
+    assert "common English" not in prompt
+
+
+def test_german_generation_prompt_is_separate_from_english_prompt() -> None:
+    prompt = LocalLlmExampleGenerator._build_prompt(
+        WordEntry(word="Vektor", meaning="向量", forms="Vektor;Vektoren"),
+        "Mathematik",
+        "德语",
+    )
+
+    assert "Generate one natural, short German sentence" in prompt
+    assert "German word: Vektor" in prompt
+    assert "German word forms: Vektor;Vektoren" in prompt
+    assert "The German sentence must include" in prompt
+    assert "English sentence" not in prompt
+    assert "Original English" not in prompt
+
+
+def test_german_batch_prompt_is_separate_from_english_prompt() -> None:
+    prompt = LocalLlmExampleGenerator._build_batch_prompt(
+        [WordEntry(word="Dienst", meaning="服务")],
+        "Informatik",
+        "德语",
+    )
+
+    assert "Generate one natural, short German sentence for each vocabulary item" in prompt
+    assert "German vocabulary items JSON" in prompt
+    assert "must not leave German words untranslated" in prompt
+    assert "English sentence" not in prompt
+
+
+def test_german_correction_prompt_is_separate_from_english_prompt() -> None:
+    prompt = LocalLlmExampleGenerator._build_correction_prompt(
+        WordEntry(word="maschinelles_Lernen", meaning="机器学习", forms="maschinelles Lernen"),
+        "KI",
+        "德语",
+    )
+
+    assert "Original German: maschinelles_Lernen" in prompt
+    assert "Normalized German candidate: maschinelles Lernen" in prompt
+    assert "whether the German word/phrase matches the Chinese meaning" in prompt
+    assert "Original English" not in prompt
+    assert "English word/phrase" not in prompt
 
 
 def test_explanation_uses_larger_token_budget(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -224,6 +269,64 @@ def test_generation_requires_chinese_meaning_only_when_entry_meaning_is_empty(
 
     with pytest.raises(RuntimeError, match="中文释义"):
         generator.generate(WordEntry(word="kernel", meaning=""))
+
+
+def test_generation_requires_chinese_meaning_when_existing_meaning_is_not_chinese(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLlm:
+        def create_chat_completion(self, **_kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "example_sentence": "The gradient changes quickly.",
+                                    "example_sentence_cn": "梯度变化很快。",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: FakeLlm())
+
+    with pytest.raises(RuntimeError, match="中文释义"):
+        generator.generate(WordEntry(word="gradient", meaning="Gradient"))
+
+
+def test_generation_fills_chinese_meaning_when_existing_meaning_is_not_chinese(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLlm:
+        def create_chat_completion(self, **_kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "example_sentence": "The gradient changes quickly.",
+                                    "example_sentence_cn": "梯度变化很快。",
+                                    "meaning": "梯度",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: FakeLlm())
+
+    result = generator.generate(WordEntry(word="gradient", meaning="Gradient"))
+
+    assert result.meaning == "梯度"
 
 
 def test_llama_create_failure_preserves_original_error(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -429,6 +532,260 @@ def test_batch_generation_rejects_swapped_language_fields(monkeypatch: pytest.Mo
         generator.generate_batch([WordEntry(word="gradient", meaning="")])
 
 
+def test_batch_generation_rejects_example_for_different_word(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeLlm:
+        def create_chat_completion(self, **_kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "items": [
+                                        {
+                                            "batch_index": 1,
+                                            "example_sentence": "The aggregate function is stable.",
+                                            "example_sentence_cn": "聚合函数很稳定。",
+                                        }
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: FakeLlm())
+
+    with pytest.raises(RuntimeError, match="未包含目标词 adapter"):
+        generator.generate_batch([WordEntry(word="adapter", meaning="适配器")])
+
+
+def test_batch_generation_accepts_word_form_in_example(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeLlm:
+        def create_chat_completion(self, **_kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "items": [
+                                        {
+                                            "batch_index": 1,
+                                            "example_sentence": "The image is normalized before inference.",
+                                            "example_sentence_cn": "图像在推理前会被归一化。",
+                                        }
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: FakeLlm())
+
+    results = generator.generate_batch([WordEntry(word="normalize", meaning="归一化", forms="normalize;normalized")])
+
+    assert results[0][1].example_sentence == "The image is normalized before inference."
+
+
+def test_batch_generation_accepts_simple_plural_in_example(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeLlm:
+        def create_chat_completion(self, **_kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "items": [
+                                        {
+                                            "batch_index": 1,
+                                            "example_sentence": "Tokens are generated from the text.",
+                                            "example_sentence_cn": "标记从文本中生成。",
+                                        }
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: FakeLlm())
+
+    results = generator.generate_batch([WordEntry(word="token", meaning="标记")])
+
+    assert results[0][1].example_sentence == "Tokens are generated from the text."
+
+
+def test_batch_generation_rejects_duplicate_batch_index(monkeypatch: pytest.MonkeyPatch) -> None:
+    class FakeLlm:
+        def create_chat_completion(self, **_kwargs):
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "items": [
+                                        {
+                                            "batch_index": 1,
+                                            "example_sentence": "Architecture shapes systems.",
+                                            "example_sentence_cn": "架构塑造系统。",
+                                        },
+                                        {
+                                            "batch_index": 1,
+                                            "example_sentence": "A domain defines context.",
+                                            "example_sentence_cn": "领域定义上下文。",
+                                        },
+                                    ]
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: FakeLlm())
+
+    with pytest.raises(RuntimeError, match="重复 batch_index"):
+        generator.generate_batch(
+            [
+                WordEntry(word="architecture", meaning=""),
+                WordEntry(word="domain", meaning=""),
+            ]
+        )
+
+
+def test_generation_retries_when_model_puts_chinese_in_target_sentence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLlm:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_chat_completion(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                content = {
+                    "example_sentence": "向量有方向。",
+                    "example_sentence_cn": "向量有方向。",
+                }
+            else:
+                prompt = kwargs["messages"][1]["content"]
+                assert "previous JSON response was invalid" in prompt
+                content = {
+                    "example_sentence": "A vector has direction.",
+                    "example_sentence_cn": "向量有方向。",
+                }
+            return {"choices": [{"message": {"content": json.dumps(content, ensure_ascii=False)}}]}
+
+    llm = FakeLlm()
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: llm)
+
+    result = generator.generate(WordEntry(word="vector", meaning="向量"))
+
+    assert result.example_sentence == "A vector has direction."
+    assert llm.calls == 2
+
+
+def test_batch_generation_retries_when_model_puts_chinese_in_target_sentence(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    class FakeLlm:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def create_chat_completion(self, **kwargs):
+            self.calls += 1
+            if self.calls == 1:
+                content = {
+                    "items": [
+                        {
+                            "batch_index": 1,
+                            "example_sentence": "服务很重要。",
+                            "example_sentence_cn": "服务很重要。",
+                        }
+                    ]
+                }
+            else:
+                prompt = kwargs["messages"][1]["content"]
+                assert "previous JSON response was invalid" in prompt
+                assert "example_sentence must be German only" in prompt
+                content = {
+                    "items": [
+                        {
+                            "batch_index": 1,
+                            "example_sentence": "Der Dienst ist wichtig.",
+                            "example_sentence_cn": "这个服务很重要。",
+                        }
+                    ]
+                }
+            return {"choices": [{"message": {"content": json.dumps(content, ensure_ascii=False)}}]}
+
+    llm = FakeLlm()
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: llm)
+
+    results = generator.generate_batch([WordEntry(word="Dienst", meaning="服务")], language="德语")
+
+    assert results[0][1].example_sentence == "Der Dienst ist wichtig."
+    assert llm.calls == 2
+
+
+def test_generate_many_keeps_progress_argument_position(monkeypatch: pytest.MonkeyPatch) -> None:
+    calls = []
+
+    class FakeLlm:
+        def create_chat_completion(self, **kwargs):
+            calls.append(kwargs)
+            return {
+                "choices": [
+                    {
+                        "message": {
+                            "content": json.dumps(
+                                {
+                                    "example_sentence": "A vector has direction.",
+                                    "example_sentence_cn": "向量有方向。",
+                                },
+                                ensure_ascii=False,
+                            )
+                        }
+                    }
+                ]
+            }
+
+    progress_calls = []
+    generator = LocalLlmExampleGenerator(Path("model"))
+    monkeypatch.setattr(generator, "_load_model", lambda _slot: FakeLlm())
+    monkeypatch.setattr(generator, "_parallel_workers", lambda: 1)
+
+    results, errors, workers = generator.generate_many(
+        [WordEntry(word="vector", meaning="向量")],
+        "AI",
+        lambda done, total, worker_count: progress_calls.append((done, total, worker_count)),
+        lambda: "running",
+    )
+
+    assert errors == []
+    assert workers == 1
+    assert results[0][1].example_sentence == "A vector has direction."
+    assert progress_calls == [(1, 1, 1)]
+    assert "Target vocabulary language: 德语" not in calls[0]["messages"][1]["content"]
+
+
 def test_batch_prompt_requires_concise_chinese_meanings() -> None:
     prompt = LocalLlmExampleGenerator._build_batch_prompt(
         [WordEntry(word="service", meaning="")],
@@ -437,6 +794,38 @@ def test_batch_prompt_requires_concise_chinese_meanings() -> None:
 
     assert "short Chinese word or phrase" in prompt
     assert "must not leave English words untranslated" in prompt
+
+
+def test_correction_prompt_only_checks_word_meaning_match_and_obvious_word_errors() -> None:
+    prompt = LocalLlmExampleGenerator._build_correction_prompt(
+        WordEntry(word="machine_learning", meaning="机器学习", forms="machine learnings"),
+        "AI",
+    )
+
+    assert "whether the English word/phrase matches the Chinese meaning" in prompt
+    assert "should_update to false" in prompt
+    assert "Do not rewrite the word for style" in prompt
+    assert "Word forms" in prompt
+
+
+def test_correction_parse_can_skip_unchanged_words() -> None:
+    correction = prompts.parse_correction_response(
+        json.dumps({"should_update": False, "corrected_word": "kernel", "note": ""}),
+        WordEntry(word="kernel", meaning="内核"),
+    )
+
+    assert correction.corrected_word == "kernel"
+    assert correction.should_update is False
+
+
+def test_correction_parse_forces_update_for_underscore_format_error() -> None:
+    correction = prompts.parse_correction_response(
+        json.dumps({"should_update": False, "corrected_word": "machine_learning", "note": ""}),
+        WordEntry(word="machine_learning", meaning="机器学习"),
+    )
+
+    assert correction.corrected_word == "machine learning"
+    assert correction.should_update is True
 
 
 def test_small_cuda_card_prefers_single_instance_batch_generation(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -575,7 +964,7 @@ def test_model_dir_rejects_multiple_gguf_files(tmp_path: Path) -> None:
     (tmp_path / "second.gguf").write_bytes(b"second")
     generator = LocalLlmExampleGenerator(tmp_path)
 
-    with pytest.raises(RuntimeError, match="只能存在一个 .gguf"):
+    with pytest.raises(RuntimeError, match="只能保留一个 .gguf"):
         generator._ensure_model_path()
 
 
@@ -733,7 +1122,7 @@ def test_pdf_vocabulary_cleaner_keeps_rows_when_one_batch_fails(
     )
 
     assert [entry.word for entry in cleaned] == ["vector", "matrix"]
-    assert progress[-1] == ("AI 审阅 CSV 完成，1 批失败并已保留", 80)
+    assert progress[-1] == ("AI 检查词表完成，1 批失败并已保留", 80)
 
 
 def test_pdf_vocabulary_cleaner_accepts_batch_row_numbers() -> None:

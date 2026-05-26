@@ -27,6 +27,7 @@ class BatchWorker(QObject):
         scope: str,
         generator: ExampleGenerator,
         control: Callable[[], str],
+        language: str = "",
     ) -> None:
         super().__init__()
         self._action = action
@@ -37,6 +38,7 @@ class BatchWorker(QObject):
             scope,
             generator,
             control,
+            language=language,
             sleep=lambda seconds: QThread.msleep(int(seconds * 1000)),
         )
 
@@ -164,3 +166,19 @@ class UiThreadBridge(QObject):
     @Slot()
     def on_csv_task_thread_finished(self) -> None:
         self._app._on_csv_task_thread_finished()
+
+    @Slot(str, int, int, int, float)
+    def on_batch_progress(self, action: str, done: int, total: int, workers: int, elapsed: float) -> None:
+        self._app._on_batch_progress(action, done, total, workers, elapsed)
+
+    @Slot(str, list, list, int)
+    def on_batch_finished(self, action: str, updates: list, errors: list, total: int) -> None:
+        self._app._on_batch_finished(action, updates, errors, total)
+
+    @Slot(str, str)
+    def on_batch_failed(self, action: str, message: str) -> None:
+        self._app._on_batch_failed(action, message)
+
+    @Slot()
+    def on_batch_thread_finished(self) -> None:
+        self._app._on_batch_thread_finished()

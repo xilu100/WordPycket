@@ -245,7 +245,11 @@ class SqliteWordRepository(WordRepository):
             VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(word) DO UPDATE SET
                 source_index = excluded.source_index,
-                meaning = excluded.meaning,
+                meaning = CASE
+                    WHEN excluded.meaning = ''
+                    THEN word_entries.meaning
+                    ELSE excluded.meaning
+                END,
                 frequency = excluded.frequency,
                 forms = excluded.forms,
                 example_sentence = CASE

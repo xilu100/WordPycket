@@ -46,6 +46,23 @@ def test_llm_job_poller_submits_explain_without_qt_state() -> None:
     ]
 
 
+def test_llm_job_poller_rejects_duplicate_explain_job() -> None:
+    generator = FakeGenerator()
+    poller = LlmJobPoller(generator)
+    entry = WordEntry(word="vector", meaning="向量")
+
+    poller.submit_explain(entry, "AI", "英语")
+
+    try:
+        poller.submit_explain(entry, "AI", "英语")
+    except RuntimeError as error:
+        assert "还在解释中" in str(error)
+    else:
+        raise AssertionError("duplicate explain job should fail")
+
+    assert len(generator.submissions) == 1
+
+
 def test_llm_job_poller_normalizes_explain_statuses() -> None:
     entry = WordEntry(word="vector", meaning="向量")
     generator = FakeGenerator(
@@ -100,7 +117,7 @@ def test_llm_job_poller_returns_failed_event_for_invalid_explain_result() -> Non
     event = poller.poll_explain()
 
     assert isinstance(event, ExplainFailed)
-    assert "LLM 结果不是 JSON 对象" in event.message
+    assert "AI 返回结果格式不正确" in event.message
     assert poller.is_idle()
 
 
@@ -118,7 +135,7 @@ def test_llm_job_poller_pops_completed_batch_jobs() -> None:
     )
     poller = LlmJobPoller(generator)
     entry = WordEntry(word="vector", meaning="向量")
-    poller.submit_batch_job("补充", entry, "AI")
+    poller.submit_batch_job("补充", entry, "AI", "德语")
 
     events = poller.poll_batch()
 
@@ -128,6 +145,7 @@ def test_llm_job_poller_pops_completed_batch_jobs() -> None:
         "example_sentence": "A vector rotates.",
         "example_sentence_cn": "向量会旋转。",
     }
+    assert generator.submissions[0][1]["language"] == "德语"
     assert not poller.has_batch_jobs()
 
 
@@ -139,8 +157,9 @@ def test_llm_job_poller_submits_supplement_batch_job() -> None:
         WordEntry(word="matrix", meaning="矩阵", source_index=2),
     ]
 
-    poller.submit_supplement_batch_job(entries, "AI")
+    poller.submit_supplement_batch_job(entries, "AI", "德语")
 
     assert generator.submissions[0][0] == "run_action"
     assert generator.submissions[0][1]["action"] == "generate_batch"
+    assert generator.submissions[0][1]["language"] == "德语"
     assert [item["word"] for item in generator.submissions[0][1]["entries"]] == ["vector", "matrix"]
