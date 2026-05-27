@@ -843,7 +843,7 @@ def test_small_cuda_card_prefers_single_instance_batch_generation(monkeypatch: p
     }
 
 
-def test_large_cuda_card_keeps_parallel_instances(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_large_cuda_card_still_uses_single_parallel_instance(monkeypatch: pytest.MonkeyPatch) -> None:
     generator = LocalLlmExampleGenerator(Path("model"))
     monkeypatch.delenv("WORDPYCKET_LLM_BATCH_SIZE", raising=False)
     monkeypatch.setattr(generator, "_find_existing_model_path", lambda: None)
@@ -856,7 +856,7 @@ def test_large_cuda_card_keeps_parallel_instances(monkeypatch: pytest.MonkeyPatc
 
     assert strategy["mode"] == "parallel"
     assert strategy["batch_size"] == 1
-    assert strategy["parallelism"] >= 3
+    assert strategy["parallelism"] == 1
 
 
 def test_mps_process_parallelism_uses_single_model_instance(monkeypatch: pytest.MonkeyPatch) -> None:

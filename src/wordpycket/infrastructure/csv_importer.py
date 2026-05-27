@@ -41,13 +41,6 @@ class WordFrequencyCsvImporter:
     SCHEMAS = (
         CsvColumnSchema("英语", ("Index", "English", "Chinese", "Frequency", "Forms")),
         CsvColumnSchema("德语", ("Index", "Deutsch", "Chinesisch", "Häufigkeit", "Formen")),
-        CsvColumnSchema("法语", ("Index", "Français", "Chinois", "Fréquence", "Formes")),
-        CsvColumnSchema("西班牙语", ("Index", "Español", "Chino", "Frecuencia", "Formas")),
-        CsvColumnSchema("意大利语", ("Index", "Italiano", "Cinese", "Frequenza", "Forme")),
-        CsvColumnSchema("葡萄牙语", ("Index", "Português", "Chinês", "Frequência", "Formas")),
-        CsvColumnSchema("荷兰语", ("Index", "Nederlands", "Chinees", "Frequentie", "Vormen")),
-        CsvColumnSchema("日语", ("Index", "日本語", "中国語", "頻度", "語形")),
-        CsvColumnSchema("韩语", ("Index", "한국어", "중국어", "빈도", "형태")),
     )
 
     def __init__(self, csv_path: Path) -> None:

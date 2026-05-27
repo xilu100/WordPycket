@@ -12,11 +12,6 @@ PROJECT_ROOT = Path(__file__).resolve().parents[1]
 SPACY_MODEL_PACKAGES = (
     "en_core_web_sm",
     "de_core_news_sm",
-    "fr_core_news_sm",
-    "es_core_news_sm",
-    "it_core_news_sm",
-    "pt_core_news_sm",
-    "nl_core_news_sm",
 )
 
 

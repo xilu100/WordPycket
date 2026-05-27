@@ -220,7 +220,13 @@ class VocabularyCleaner(Protocol):
 class DeterministicMultilingualFrequencyEngine:
     """Deterministic corpus frequency analyzer. No LLMs, APIs, or transformers."""
 
-    STRICT_SCHEMA = CsvColumnSchema("英语", ("Index", "English", "Chinese", "Frequency", "Forms"))
+    ENGLISH_SCHEMA = CsvColumnSchema("英语", ("Index", "English", "Chinese", "Frequency", "Forms"))
+    GERMAN_SCHEMA = CsvColumnSchema("德语", ("Index", "Deutsch", "Chinesisch", "Häufigkeit", "Formen"))
+    STRICT_SCHEMA = ENGLISH_SCHEMA
+    SCHEMAS_BY_CODE: Mapping[str, CsvColumnSchema] = {
+        "en": ENGLISH_SCHEMA,
+        "de": GERMAN_SCHEMA,
+    }
     _LATIN_TOKEN = re.compile(r"[A-Za-zÀ-ÖØ-öø-ÿ]+(?:[-'][A-Za-zÀ-ÖØ-öø-ÿ]+)*")
     _CJK_RUN = re.compile(r"[\u3400-\u9fff]+")
     _OCR_GLUE = re.compile(r"(?<=[a-z])-\s*\n\s*(?=[a-z])", re.IGNORECASE)
@@ -429,8 +435,6 @@ class DeterministicMultilingualFrequencyEngine:
         "woher wohin zu zum zur über"
         .split()
     )
-    _ZH_STOPWORDS = frozenset("的 了 和 是 在 有 与 及 或 为 对 中 上 下 而 被 将 把 这 那 一个 一种 我们 你们 他们".split())
-
     PROFILES: Mapping[str, LanguageProfile] = {
         "en": LanguageProfile(
             code="en",
@@ -448,15 +452,6 @@ class DeterministicMultilingualFrequencyEngine:
             spacy_models=("de_core_news_sm",),
             markers=frozenset("der die das und ist nicht mit ein eine von zu".split()),
             stopwords=_DE_STOPWORDS,
-        ),
-        "zh": LanguageProfile(
-            code="zh",
-            label="中文",
-            spacy_models=("zh_core_web_sm",),
-            markers=frozenset(),
-            stopwords=_ZH_STOPWORDS,
-            allowed_pos=frozenset({"NOUN", "VERB", "ADJ", "PROPN"}),
-            phrase_extraction=False,
         ),
     }
 
@@ -524,11 +519,13 @@ class DeterministicMultilingualFrequencyEngine:
         if not documents:
             raise RuntimeError(f"没有找到可分析的 .txt 文件：{folder}")
         terms = self._analyze_documents(documents, max_entries)
-        return self._entries_from_terms(terms), self._dominant_language(terms), self.STRICT_SCHEMA
+        language = self._dominant_language(terms)
+        return self._entries_from_terms(terms), language, self._schema_for_language_label(language)
 
     def analyze_text(self, text: str, max_entries: int = 10000, document_id: str = "pdf") -> tuple[list[WordEntry], str, CsvColumnSchema]:
         terms = self._analyze_documents(((document_id, text),), max_entries)
-        return self._entries_from_terms(terms), self._dominant_language(terms), self.STRICT_SCHEMA
+        language = self._dominant_language(terms)
+        return self._entries_from_terms(terms), language, self._schema_for_language_label(language)
 
     def _iter_text_files(self, folder: Path) -> Iterator[tuple[str, str]]:
         for path in sorted(folder.rglob("*.txt"), key=lambda item: str(item).lower()):
@@ -582,23 +579,20 @@ class DeterministicMultilingualFrequencyEngine:
         return "\n".join(lines)
 
     def detect_language(self, text: str) -> str:
-        zh_score = len(self._CJK_RUN.findall(text)) * 6 + len(re.findall(r"[\u3400-\u9fff]", text))
         latin_words = [match.group(0).lower() for match in self._LATIN_TOKEN.finditer(text)]
         if not latin_words:
-            return "zh" if zh_score else "en"
+            return "en"
 
         counts = Counter(latin_words)
-        scores = {"zh": zh_score}
+        scores = {}
         for code, profile in self.PROFILES.items():
-            if code == "zh":
-                continue
             marker_hits = sum(counts[word] for word in profile.markers)
             lexical_hits = sum(
                 count for word, count in counts.items()
                 if word not in profile.stopwords and self._is_latin_candidate(word)
             )
             scores[code] = marker_hits * 8 + lexical_hits
-        priority = {"en": 2, "de": 1, "zh": 0}
+        priority = {"en": 2, "de": 1}
         return max(scores, key=lambda code: (scores[code], priority.get(code, 0)))
 
     def tokenize(self, text: str, language: str, document_id: str) -> Iterator[TextToken]:
@@ -606,9 +600,6 @@ class DeterministicMultilingualFrequencyEngine:
         nlp = self._spacy_pipeline(profile)
         if nlp is not None:
             yield from self._spacy_tokens(nlp, text, profile, document_id)
-            return
-        if profile.code == "zh":
-            yield from self._fallback_zh_tokens(text, profile, document_id)
             return
         yield from self._fallback_latin_tokens(text, profile, document_id)
 
@@ -637,12 +628,6 @@ class DeterministicMultilingualFrequencyEngine:
             lemma = self._fallback_lemma(surface, profile.code)
             if self._keep_token(surface, lemma, "", profile):
                 yield TextToken(surface=surface, lemma=lemma, pos="", language=profile.code, document_id=document_id)
-
-    def _fallback_zh_tokens(self, text: str, profile: LanguageProfile, document_id: str) -> Iterator[TextToken]:
-        for run in self._CJK_RUN.findall(text):
-            for token in self._segment_zh_run(run):
-                if self._keep_token(token, token, "", profile):
-                    yield TextToken(surface=token, lemma=token, pos="", language=profile.code, document_id=document_id)
 
     @staticmethod
     def _text_batches(text: str, max_chars: int = 50000) -> Iterator[str]:
@@ -803,6 +788,12 @@ class DeterministicMultilingualFrequencyEngine:
         code = counts.most_common(1)[0][0] if counts else "en"
         return self.PROFILES.get(code, self.PROFILES["en"]).label
 
+    def _schema_for_language_label(self, language: str) -> CsvColumnSchema:
+        for schema in self.SCHEMAS_BY_CODE.values():
+            if schema.language == language:
+                return schema
+        return self.ENGLISH_SCHEMA
+
     @classmethod
     def _spacy_pipeline(cls, profile: LanguageProfile):
         if profile.code in cls._SPACY_PIPELINES:
@@ -839,8 +830,6 @@ class DeterministicMultilingualFrequencyEngine:
             return False
         if pos and pos not in profile.allowed_pos:
             return False
-        if profile.code == "zh":
-            return len(candidate) >= 2 and not self._NOISE_LINE.fullmatch(candidate)
         return self._is_latin_candidate(candidate)
 
     @staticmethod
@@ -912,16 +901,6 @@ class DeterministicMultilingualFrequencyEngine:
             if len(word) > len(suffix) + 3 and word.endswith(suffix):
                 return word[: -len(suffix)]
         return word
-
-    @staticmethod
-    def _segment_zh_run(text: str) -> Iterator[str]:
-        if len(text) == 2:
-            yield text
-            return
-        for index in range(0, len(text) - 1, 2):
-            token = text[index: index + 2]
-            if len(token) == 2:
-                yield token
 
     def _configured_language(self, document_id: str) -> str | None:
         value = self._language_by_file.get(document_id) or self._language_by_file.get(Path(document_id).name)
@@ -1075,22 +1054,23 @@ class PdfVocabularyImporter:
     def detect_language(cls, text: str) -> tuple[str, CsvColumnSchema]:
         engine = DeterministicMultilingualFrequencyEngine()
         code = engine.detect_language(engine.clean_text(text))
-        return engine.PROFILES.get(code, engine.PROFILES["en"]).label, engine.STRICT_SCHEMA
+        language = engine.PROFILES.get(code, engine.PROFILES["en"]).label
+        return language, engine._schema_for_language_label(language)
 
     @staticmethod
     def write_csv(entries: list[WordEntry], schema: CsvColumnSchema, csv_path: Path) -> None:
         csv_path.parent.mkdir(parents=True, exist_ok=True)
         with csv_path.open("w", encoding="utf-8-sig", newline="") as file:
-            writer = csv.DictWriter(file, fieldnames=list(DeterministicMultilingualFrequencyEngine.STRICT_SCHEMA.columns))
+            writer = csv.DictWriter(file, fieldnames=list(schema.columns))
             writer.writeheader()
             for entry in entries:
                 writer.writerow(
                     {
-                        "Index": entry.source_index,
-                        "English": entry.word,
-                        "Chinese": entry.meaning,
-                        "Frequency": entry.frequency,
-                        "Forms": entry.forms,
+                        schema.source_index: entry.source_index,
+                        schema.word: entry.word,
+                        schema.meaning: entry.meaning,
+                        schema.frequency: entry.frequency,
+                        schema.forms: entry.forms,
                     }
                 )
 

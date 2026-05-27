@@ -74,7 +74,7 @@ def _jsonable(value: Any) -> Any:
 
 class JobStore:
     def __init__(self, max_workers: int) -> None:
-        self._max_workers = max(1, max_workers)
+        self._max_workers = 1
         self._executor = concurrent.futures.ThreadPoolExecutor(max_workers=self._max_workers)
         self._slots: queue.LifoQueue[int] = queue.LifoQueue()
         for slot in reversed(range(self._max_workers)):

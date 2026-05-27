@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from wordpycket.infrastructure.csv_importer import WordFrequencyCsvImporter
 from wordpycket.infrastructure.pdf_vocabulary_importer import (
     DeterministicMultilingualFrequencyEngine,
@@ -45,22 +47,15 @@ def test_pdf_vocabulary_importer_detects_german_with_fixed_schema() -> None:
     )
 
     assert language == "德语"
-    assert schema.columns == ("Index", "English", "Chinese", "Frequency", "Forms")
+    assert schema.columns == ("Index", "Deutsch", "Chinesisch", "Häufigkeit", "Formen")
     by_word = {entry.word: entry for entry in entries}
     assert by_word["vektor"].frequency == 2
     assert by_word["vektor"].forms == "vektor;vektoren"
 
 
-def test_pdf_vocabulary_importer_segments_chinese_without_model() -> None:
-    entries, language, schema = PdfVocabularyImporter.entries_from_text(
-        "机器学习提高系统性能。机器学习改善搜索质量。"
-    )
-
-    assert language == "中文"
-    assert schema.columns == ("Index", "English", "Chinese", "Frequency", "Forms")
-    terms = {entry.word: entry.frequency for entry in entries}
-    assert terms["机器"] == 2
-    assert terms["学习"] == 2
+def test_pdf_vocabulary_importer_rejects_chinese_source_text() -> None:
+    with pytest.raises(RuntimeError, match="没有识别到可统计的词或词组"):
+        PdfVocabularyImporter.entries_from_text("机器学习提高系统性能。机器学习改善搜索质量。")
 
 
 def test_pdf_vocabulary_importer_writes_csv_compatible_with_csv_importer(tmp_path) -> None:
@@ -76,6 +71,22 @@ def test_pdf_vocabulary_importer_writes_csv_compatible_with_csv_importer(tmp_pat
     assert result.entries
     assert result.entries[0].source_index == 1
     assert result.entries[0].frequency > 0
+
+
+def test_pdf_vocabulary_importer_writes_german_csv_compatible_with_csv_importer(tmp_path) -> None:
+    csv_path = tmp_path / "word_frequency.csv"
+    entries, _language, schema = PdfVocabularyImporter.entries_from_text(
+        "Der Vektor ist wichtig. Die Vektoren sind wichtig."
+    )
+
+    PdfVocabularyImporter.write_csv(entries, schema, csv_path)
+    result = WordFrequencyCsvImporter(csv_path).load_with_metadata()
+
+    assert result.language == "德语"
+    assert csv_path.read_text(encoding="utf-8-sig").splitlines()[0] == (
+        "Index,Deutsch,Chinesisch,Häufigkeit,Formen"
+    )
+    assert result.entries
 
 
 def test_pdf_vocabulary_importer_ignores_formulas_urls_and_code() -> None:

@@ -26,16 +26,6 @@ class ArgosMeaningTranslator:
         normalized = language.strip().casefold()
         if normalized in {"德语", "german", "de", "deutsch"}:
             return "de"
-        if normalized in {"法语", "french", "fr", "francais", "français"}:
-            return "fr"
-        if normalized in {"西班牙语", "spanish", "es", "espanol", "español"}:
-            return "es"
-        if normalized in {"意大利语", "italian", "it"}:
-            return "it"
-        if normalized in {"葡萄牙语", "portuguese", "pt"}:
-            return "pt"
-        if normalized in {"荷兰语", "dutch", "nl"}:
-            return "nl"
         return "en"
 
     @staticmethod
@@ -48,13 +38,17 @@ class ArgosMeaningTranslator:
     def _translate_cached(source_code: str, target_code: str, text: str) -> str:
         if not text:
             return ""
+        return _translate_direct(source_code, target_code, text)
+
+
+def _translate_direct(source_code: str, target_code: str, text: str) -> str:
+    translation = _installed_translation(source_code, target_code)
+    if translation is None:
+        _install_translation_package(source_code, target_code)
         translation = _installed_translation(source_code, target_code)
-        if translation is None:
-            _install_translation_package(source_code, target_code)
-            translation = _installed_translation(source_code, target_code)
-        if translation is None:
-            raise RuntimeError(f"Argos Translate 缺少 {source_code}->{target_code} 翻译包。")
-        return str(translation.translate(text))
+    if translation is None:
+        raise RuntimeError(f"Argos Translate 缺少 {source_code}->{target_code} 翻译包。")
+    return str(translation.translate(text))
 
 
 def _installed_translation(source_code: str, target_code: str):

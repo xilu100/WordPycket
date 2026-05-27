@@ -829,8 +829,7 @@ class WordPycketApp:
         entry = state.entry if state is not None else None
         if entry is None:
             return
-        if self._llm_jobs.has_explain_job():
-            QMessageBox.information(self._window, "AI 速解", "当前词条还在解释中。")
+        if not self._prepare_exclusive_llm_task("AI 速解"):
             return
         if self._example_generator is None:
             QMessageBox.information(self._window, "无法使用 AI 速解", "未配置本地 AI 模型服务。")
@@ -1178,6 +1177,8 @@ class WordPycketApp:
             QMessageBox.information(self._window, "PDF 导入中", "请等待当前 PDF 导入完成。")
             return
         if use_llm_cleanup:
+            if not self._prepare_exclusive_llm_task("PDF 词表优化"):
+                return
             self._cancel_llm_idle_close()
         self._pdf_import_started_at = time.monotonic()
         self._pdf_ai_started_at = 0.0
@@ -1671,6 +1672,8 @@ class WordPycketApp:
                 "当前模型服务不支持后台任务。",
             )
             return
+        if not self._prepare_exclusive_llm_task(f"AI {action_label}"):
+            return
         self._warn_if_using_user_model()
 
         scope = self._ai_scope
@@ -1732,6 +1735,43 @@ class WordPycketApp:
 
     def _can_submit_llm_jobs(self) -> bool:
         return self._llm_jobs.can_submit_jobs()
+
+    def _prepare_exclusive_llm_task(self, action: str) -> bool:
+        if self._llm_jobs.is_idle():
+            return True
+        answer = QMessageBox.question(
+            self._window,
+            action,
+            "当前已有 AI 任务正在运行。为了保证同一时间只加载一个本地模型实例，需要中断当前任务并关闭模型服务后再开始新任务。\n\n是否中断当前 AI 任务？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if answer != QMessageBox.StandardButton.Yes:
+            return False
+        self._abort_active_llm_jobs()
+        return True
+
+    def _abort_active_llm_jobs(self) -> None:
+        try:
+            self._llm_jobs.finish_explain()
+            self._llm_jobs.clear_batch_jobs()
+        except Exception:
+            pass
+        if self._batch_state in {"running", "paused"}:
+            self._batch_state = "stopped"
+            self._batch_finished = True
+            self._set_batch_idle()
+            self._clear_batch_progress("AI 任务已中断")
+        if self._explain_current_study_button is not None:
+            self._explain_current_study_button.setText("AI 速解")
+            self._explain_current_study_button.setEnabled(True)
+        if self._llm_poll_timer is not None and self._llm_poll_timer.isActive():
+            self._llm_poll_timer.stop()
+        if self._example_generator is not None and hasattr(self._example_generator, "close"):
+            try:
+                self._example_generator.close()
+            except Exception:
+                pass
 
     def _warn_if_using_user_model(self) -> None:
         if self._user_model_warning_shown or self._example_generator is None:
@@ -2088,11 +2128,12 @@ class WordPycketApp:
         return initial_batch_parallel_limit()
 
     def _recommended_batch_parallel_limit(self) -> int:
-        fallback = self._initial_batch_parallel_limit()
+        fallback = 1
         if self._example_generator is None or not hasattr(self._example_generator, "recommended_process_parallelism"):
             return fallback
         try:
-            return max(1, min(8, int(self._example_generator.recommended_process_parallelism())))
+            int(self._example_generator.recommended_process_parallelism())
+            return 1
         except Exception:
             return fallback
 
@@ -2113,7 +2154,7 @@ class WordPycketApp:
                 return fallback
             return {
                 "mode": mode,
-                "parallelism": max(1, min(8, int(raw.get("parallelism", 1)))),
+                "parallelism": 1,
                 "batch_size": max(1, min(32, int(raw.get("batch_size", 1)))),
             }
         except Exception:

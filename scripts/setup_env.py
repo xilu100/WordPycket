@@ -18,12 +18,11 @@ DEFAULT_VENV = PROJECT_ROOT / ".venv"
 SPACY_MODELS = {
     "en": "en_core_web_sm",
     "de": "de_core_news_sm",
-    "fr": "fr_core_news_sm",
-    "es": "es_core_news_sm",
-    "it": "it_core_news_sm",
-    "pt": "pt_core_news_sm",
-    "nl": "nl_core_news_sm",
 }
+ARGOS_TRANSLATION_PAIRS = (
+    ("en", "zh"),
+    ("de", "zh"),
+)
 
 
 def main() -> int:
@@ -39,6 +38,7 @@ def main() -> int:
     install_llama_cpp(python, device, args.strict_accel or device == "cuda")
     install_nltk_data(python)
     install_spacy_models(python, args.spacy_models)
+    install_argos_translation_packages()
     install_project(python)
     print_activation_help(venv_path)
     return 0
@@ -311,6 +311,44 @@ def install_spacy_models(python: Path, model_selection: str) -> None:
             print(f"spaCy model {model} is already installed; skipping.")
             continue
         run([str(python), "-m", "spacy", "download", model])
+
+
+def install_argos_translation_packages() -> None:
+    from argostranslate import package, translate
+
+    missing_pairs = [
+        (source_code, target_code)
+        for source_code, target_code in ARGOS_TRANSLATION_PAIRS
+        if not argos_translation_installed(translate, source_code, target_code)
+    ]
+    if not missing_pairs:
+        pairs = ", ".join(f"{source}->{target}" for source, target in ARGOS_TRANSLATION_PAIRS)
+        print(f"Argos Translate packages {pairs} are already installed; skipping.")
+        return
+
+    package.update_package_index()
+    available_packages = package.get_available_packages()
+    for source_code, target_code in missing_pairs:
+        selected = next(
+            (
+                item
+                for item in available_packages
+                if item.from_code == source_code and item.to_code == target_code
+            ),
+            None,
+        )
+        if selected is None:
+            raise RuntimeError(f"Argos Translate has no available {source_code}->{target_code} package.")
+        print(f"Installing Argos Translate package {source_code}->{target_code}.")
+        package.install_from_path(selected.download())
+
+
+def argos_translation_installed(translate_module, source_code: str, target_code: str) -> bool:
+    for source_language in translate_module.get_installed_languages():
+        if source_language.code != source_code:
+            continue
+        return any(translation.to_lang.code == target_code for translation in source_language.translations_from)
+    return False
 
 
 def python_module_available(python: Path, module: str) -> bool:

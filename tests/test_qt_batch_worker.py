@@ -8,6 +8,7 @@ import threading
 import time
 
 import pytest
+from PySide6.QtWidgets import QMessageBox
 
 from wordpycket.domain.entities import WordEntry
 from pathlib import Path
@@ -151,7 +152,7 @@ def test_process_parallel_limit_override_is_bounded(monkeypatch) -> None:
     monkeypatch.setenv("WORDPYCKET_LLM_PROCESS_PARALLEL", "99")
     generator = LocalLlmExampleGenerator(Path("model"))
 
-    assert generator.recommended_process_parallelism() == 8
+    assert generator.recommended_process_parallelism() == 1
 
     monkeypatch.setenv("WORDPYCKET_LLM_PROCESS_PARALLEL", "bad")
 
@@ -478,7 +479,7 @@ def test_local_job_timeout_is_based_on_idle_progress(monkeypatch) -> None:
     assert result == []
 
 
-def test_cuda_parallelism_allows_two_workers_on_8gb_cards(monkeypatch) -> None:
+def test_cuda_parallelism_stays_single_instance_on_8gb_cards(monkeypatch) -> None:
     generator = LlmEngine(Path("model"))
     monkeypatch.delenv("WORDPYCKET_LLM_PROCESS_PARALLEL", raising=False)
     monkeypatch.setattr(generator, "_find_existing_model_path", lambda: None)
@@ -487,10 +488,10 @@ def test_cuda_parallelism_allows_two_workers_on_8gb_cards(monkeypatch) -> None:
     monkeypatch.setattr(generator, "_detect_accelerator", lambda: generator._CUDA_DEVICE)
     monkeypatch.setattr(generator, "_cuda_capacity_mb", lambda: 7 * 1024)
 
-    assert generator.recommended_process_parallelism() == 2
+    assert generator.recommended_process_parallelism() == 1
 
 
-def test_parallelism_estimate_is_cached_for_process_run(monkeypatch) -> None:
+def test_parallelism_estimate_is_fixed_for_process_run(monkeypatch) -> None:
     generator = LlmEngine(Path("model"))
     memory_values = [16 * 1024, 4 * 1024]
     monkeypatch.delenv("WORDPYCKET_LLM_PROCESS_PARALLEL", raising=False)
@@ -503,7 +504,8 @@ def test_parallelism_estimate_is_cached_for_process_run(monkeypatch) -> None:
     second = generator.recommended_process_parallelism()
 
     assert second == first
-    assert memory_values == [4 * 1024]
+    assert first == 1
+    assert memory_values == [16 * 1024, 4 * 1024]
 
 
 def test_gui_initial_batch_parallel_limit_does_not_probe_hardware(monkeypatch) -> None:
@@ -526,7 +528,7 @@ def test_gui_batch_parallel_limit_uses_generator_recommendation(monkeypatch) -> 
     app = object.__new__(WordPycketApp)
     app._example_generator = Generator()
 
-    assert app._recommended_batch_parallel_limit() == 4
+    assert app._recommended_batch_parallel_limit() == 1
 
 
 def test_gui_batch_parallel_limit_falls_back_when_recommendation_fails(monkeypatch) -> None:
@@ -539,7 +541,7 @@ def test_gui_batch_parallel_limit_falls_back_when_recommendation_fails(monkeypat
     app = object.__new__(WordPycketApp)
     app._example_generator = Generator()
 
-    assert app._recommended_batch_parallel_limit() == 3
+    assert app._recommended_batch_parallel_limit() == 1
 
 
 def test_gui_uses_supplement_batch_strategy() -> None:
@@ -560,9 +562,69 @@ def test_gui_uses_supplement_batch_strategy() -> None:
     }
     assert app._recommended_batch_strategy("释义") == {
         "mode": "parallel",
-        "parallelism": 4,
+        "parallelism": 1,
         "batch_size": 1,
     }
+
+
+def test_prepare_exclusive_llm_task_aborts_existing_jobs(monkeypatch) -> None:
+    class Jobs:
+        def __init__(self) -> None:
+            self.finished = 0
+            self.cleared = 0
+
+        def is_idle(self) -> bool:
+            return False
+
+        def finish_explain(self) -> None:
+            self.finished += 1
+
+        def clear_batch_jobs(self) -> None:
+            self.cleared += 1
+
+    class Timer:
+        def __init__(self) -> None:
+            self.active = True
+            self.stopped = 0
+
+        def isActive(self) -> bool:
+            return self.active
+
+        def stop(self) -> None:
+            self.stopped += 1
+            self.active = False
+
+    class Generator:
+        def __init__(self) -> None:
+            self.closed = 0
+
+        def close(self) -> None:
+            self.closed += 1
+
+    questions = []
+    monkeypatch.setattr(
+        QMessageBox,
+        "question",
+        lambda *args: questions.append(args) or QMessageBox.StandardButton.Yes,
+    )
+
+    jobs = Jobs()
+    timer = Timer()
+    generator = Generator()
+    app = object.__new__(WordPycketApp)
+    app._window = None
+    app._llm_jobs = jobs
+    app._batch_state = "idle"
+    app._explain_current_study_button = None
+    app._llm_poll_timer = timer
+    app._example_generator = generator
+
+    assert app._prepare_exclusive_llm_task("AI 速解") is True
+    assert questions
+    assert jobs.finished == 1
+    assert jobs.cleared == 1
+    assert timer.stopped == 1
+    assert generator.closed == 1
 
 
 def test_word_list_refresh_reloads_active_dataset() -> None:
@@ -946,10 +1008,9 @@ def test_llm_job_store_runs_bounded_jobs_incrementally() -> None:
     second = store.submit(target)
 
     first_slot = started.get(timeout=1)
-    second_slot = started.get(timeout=1)
-    assert {first_slot, second_slot} == {0, 1}
+    assert first_slot == 0
     assert store.status(first)["state"] == "running"
-    assert store.status(second)["state"] == "running"
+    assert store.status(second)["state"] == "queued"
 
     release.set()
     deadline = threading.Event()

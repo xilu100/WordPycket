@@ -334,39 +334,10 @@ class LocalLlmExampleGenerator:
         override = os.getenv("WORDPYCKET_LLM_PROCESS_PARALLEL")
         if override is not None:
             try:
-                return max(1, min(8, int(override)))
+                int(override)
             except ValueError as error:
                 raise RuntimeError("WORDPYCKET_LLM_PROCESS_PARALLEL 必须是整数。") from error
-        if self._recommended_process_parallelism is not None:
-            return self._recommended_process_parallelism
-
-        model_path = self._find_existing_model_path()
-        model_size_mb = self._model_size_mb(model_path)
-        memory_mb = self._system_capacity_mb()
-        cpu_count = os.cpu_count() or 1
-        accelerator = self._detect_accelerator()
-
-        if accelerator == self._MPS_DEVICE:
-            self._recommended_process_parallelism = 1
-            return self._recommended_process_parallelism
-
-        if accelerator == self._CUDA_DEVICE:
-            vram_mb = self._cuda_capacity_mb()
-            if vram_mb is not None:
-                vram_per_worker_mb = max(2600, int(model_size_mb * 0.65) + 900)
-                ram_per_worker_mb = max(2600, int(model_size_mb * 0.9) + 900)
-                vram_workers = max(1, vram_mb // vram_per_worker_mb)
-                ram_workers = max(1, memory_mb // ram_per_worker_mb)
-                self._recommended_process_parallelism = max(1, min(4, vram_workers, ram_workers))
-                return self._recommended_process_parallelism
-            self._recommended_process_parallelism = 1
-            return self._recommended_process_parallelism
-
-        per_worker_mb = max(3600, int(model_size_mb * 2.0) + 1400)
-        memory_workers = max(1, memory_mb // per_worker_mb)
-        cpu_budget = max(1, cpu_count - 2)
-        cpu_workers = max(1, cpu_budget // self._threads_per_model())
-        self._recommended_process_parallelism = max(1, min(2, memory_workers, cpu_workers))
+        self._recommended_process_parallelism = 1
         return self._recommended_process_parallelism
 
     def recommended_supplement_strategy(self) -> dict[str, int | str]:
@@ -619,34 +590,10 @@ class LocalLlmExampleGenerator:
         override = os.getenv("WORDPYCKET_LLM_PARALLEL")
         if override is not None:
             try:
-                return max(1, int(override))
+                int(override)
             except ValueError as error:
                 raise RuntimeError("WORDPYCKET_LLM_PARALLEL 必须是整数。") from error
-        if self._parallel_worker_count is not None:
-            return self._parallel_worker_count
-
-        model_path = self._find_existing_model_path()
-        model_size_mb = self._model_size_mb(model_path)
-        if self._detect_accelerator() == self._CUDA_DEVICE:
-            vram_mb = self._cuda_capacity_mb()
-            if vram_mb is not None:
-                per_worker_mb = max(2200, int(model_size_mb * 0.95) + 500)
-                self._parallel_worker_count = max(1, min(5, vram_mb // per_worker_mb))
-                return self._parallel_worker_count
-            self._parallel_worker_count = 1
-            return self._parallel_worker_count
-
-        if self._has_mps_device():
-            memory_mb = self._system_capacity_mb()
-            per_worker_mb = max(3200, int(model_size_mb * 1.8) + 1200)
-            self._parallel_worker_count = max(1, min(3, memory_mb // per_worker_mb))
-            return self._parallel_worker_count
-
-        memory_mb = self._system_capacity_mb()
-        cpu_count = os.cpu_count() or 1
-        per_worker_mb = max(3200, int(model_size_mb * 1.8) + 1200)
-        cpu_budget = max(1, cpu_count - 2)
-        self._parallel_worker_count = max(1, min(2, cpu_budget // self._threads_per_model(), memory_mb // per_worker_mb))
+        self._parallel_worker_count = 1
         return self._parallel_worker_count
 
     @staticmethod

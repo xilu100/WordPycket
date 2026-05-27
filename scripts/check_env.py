@@ -13,11 +13,10 @@ SRC_DIR = PROJECT_ROOT / "src"
 SPACY_MODELS = (
     "en_core_web_sm",
     "de_core_news_sm",
-    "fr_core_news_sm",
-    "es_core_news_sm",
-    "it_core_news_sm",
-    "pt_core_news_sm",
-    "nl_core_news_sm",
+)
+ARGOS_TRANSLATION_PAIRS = (
+    ("en", "zh"),
+    ("de", "zh"),
 )
 
 
@@ -28,6 +27,7 @@ def main() -> int:
     failures.extend(check_imports())
     failures.extend(check_nltk_data())
     failures.extend(check_spacy_models())
+    failures.extend(check_argos_translations())
 
     if failures:
         print("Environment check failed:")
@@ -130,6 +130,27 @@ def check_spacy_models() -> list[str]:
         if not spacy.util.is_package(model):
             failures.append(f"Missing spaCy model: {model}")
     return failures
+
+
+def check_argos_translations() -> list[str]:
+    try:
+        from argostranslate import translate
+    except Exception as error:
+        return [f"Could not import Argos Translate: {error}"]
+
+    failures = []
+    for source_code, target_code in ARGOS_TRANSLATION_PAIRS:
+        if not argos_translation_installed(translate, source_code, target_code):
+            failures.append(f"Missing Argos Translate package: {source_code}->{target_code}")
+    return failures
+
+
+def argos_translation_installed(translate_module, source_code: str, target_code: str) -> bool:
+    for source_language in translate_module.get_installed_languages():
+        if source_language.code != source_code:
+            continue
+        return any(translation.to_lang.code == target_code for translation in source_language.translations_from)
+    return False
 
 
 if __name__ == "__main__":

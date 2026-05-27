@@ -45,13 +45,6 @@ def detect_word_column(fieldnames: list[str]) -> str:
         (
             "English",
             "Deutsch",
-            "Français",
-            "Español",
-            "Italiano",
-            "Português",
-            "Nederlands",
-            "日本語",
-            "한국어",
         ),
     )
 

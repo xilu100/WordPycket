@@ -53,3 +53,15 @@ def test_csv_importer_rejects_changed_column_format(tmp_path) -> None:
 
     with pytest.raises(ValueError, match="CSV 列名不符合"):
         WordFrequencyCsvImporter(csv_path).load()
+
+
+def test_csv_importer_rejects_unsupported_language_schema(tmp_path) -> None:
+    csv_path = tmp_path / "french.csv"
+    csv_path.write_text(
+        '"Index","Français","Chinois","Fréquence","Formes"\n'
+        '1,"vecteur","向量",42,"vecteurs"\n',
+        encoding="utf-8",
+    )
+
+    with pytest.raises(ValueError, match="CSV 列名不符合"):
+        WordFrequencyCsvImporter(csv_path).load()
